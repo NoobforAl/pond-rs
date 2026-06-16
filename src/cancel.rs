@@ -1,17 +1,20 @@
 //! A small, runtime-agnostic cancellation token.
 //!
-//! This replaces Go pond's use of `context.Context` / `context.WithCancelCause`.
+//! A runtime-agnostic stand-in for a cancellation context, with no `std`
+//! synchronization context or runtime dependency.
 //! A [`CancelToken`] can be cancelled once; all clones observe the cancellation
 //! and any number of tasks can `await` it. An optional [`Error`] cause is stored
 //! so waiters can learn *why* cancellation happened (e.g. the pool was stopped
 //! versus an explicit cancel).
 
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use event_listener::Event;
 
 use crate::error::Error;
+use crate::runtime::Spawner;
 
 /// A cloneable handle to a one-shot cancellation signal.
 ///
@@ -84,6 +87,43 @@ impl CancelToken {
         } else {
             None
         }
+    }
+
+    /// Cancels this token when `fut` completes.
+    ///
+    /// Spawns a lightweight watcher on `spawner` that awaits `fut` and then
+    /// cancels. This bridges any external cancellation source into a
+    /// pool/group/subpool — e.g. a `tokio_util::sync::CancellationToken`'s
+    /// `cancelled()` future, a request-scoped future, or a `oneshot` receiver.
+    /// The future's output (if any) is ignored.
+    pub fn cancel_on<S, F>(&self, spawner: &S, fut: F)
+    where
+        S: Spawner,
+        F: Future + Send + 'static,
+        F::Output: Send,
+    {
+        let token = self.clone();
+        spawner.spawn(Box::pin(async move {
+            let _ = fut.await;
+            token.cancel();
+        }));
+    }
+
+    /// Cancels this token after `dur` elapses (a deadline).
+    ///
+    /// Requires the `runtime-tokio` feature (uses Tokio's timer). The watcher is
+    /// spawned on `spawner`.
+    #[cfg(feature = "runtime-tokio")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "runtime-tokio")))]
+    pub fn cancel_after<S>(&self, spawner: &S, dur: std::time::Duration)
+    where
+        S: Spawner,
+    {
+        let token = self.clone();
+        spawner.spawn(Box::pin(async move {
+            tokio::time::sleep(dur).await;
+            token.cancel();
+        }));
     }
 
     /// Resolves once the token is cancelled. Returns immediately if already cancelled.

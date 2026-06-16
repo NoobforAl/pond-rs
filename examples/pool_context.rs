@@ -1,4 +1,4 @@
-//! Cancel a pool's queued work with a shared `CancelToken` (pond's `WithContext`).
+//! Cancel a pool's queued work with a shared `CancelToken`.
 //!
 //! Run with: `cargo run --example pool_context`
 

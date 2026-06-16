@@ -1,6 +1,6 @@
 //! Pool metrics.
 //!
-//! Mirrors pond's metric surface: running workers, submitted, waiting,
+//! The pool's metric surface: running workers, submitted, waiting,
 //! successful, failed, completed, dropped and canceled task counts.
 
 use std::sync::atomic::{AtomicU64, Ordering};

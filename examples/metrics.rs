@@ -1,8 +1,8 @@
 //! Read pool metrics — the integration point for exporters like Prometheus.
 //!
 //! A Prometheus exporter would register gauges/counters backed by these
-//! accessors (e.g. `pool.running_workers()`, `pool.submitted_tasks()`), exactly
-//! as the Go `pond` Prometheus example does. Here we simply print a snapshot.
+//! accessors (e.g. `pool.running_workers()`, `pool.submitted_tasks()`). Here we
+//! simply print a snapshot.
 //!
 //! Run with: `cargo run --example metrics`
 

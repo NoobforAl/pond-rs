@@ -1,7 +1,9 @@
 //! # pond
 //!
-//! An idiomatic, runtime-agnostic worker pool for Rust — a from-scratch rewrite of
-//! the Go [`pond`](https://github.com/alitto/pond) library.
+//! An idiomatic, runtime-agnostic worker pool for Rust.
+//!
+//! Inspired by Pond, a Go worker-pool library — this is an independent Rust
+//! project, not a binding or a port.
 //!
 //! pond provides two flavours of pool that share the same concepts (bounded
 //! concurrency, task handles, groups, subpools, metrics, graceful shutdown):
@@ -44,11 +46,13 @@ compile_error!(
 mod macros;
 
 mod cancel;
+mod context;
 mod error;
 mod metrics;
 mod runtime;
 
 pub use crate::cancel::CancelToken;
+pub use crate::context::TaskContext;
 pub use crate::error::{Error, Result};
 pub use crate::metrics::MetricsSnapshot;
 pub use crate::runtime::Spawner;
@@ -60,11 +64,13 @@ pub use crate::runtime::TokioSpawner;
 mod group;
 mod options;
 mod pool;
+mod submit;
 mod subpool;
-pub use crate::group::{GroupError, ResultTaskGroup, TryTaskGroup};
+pub use crate::group::{GroupBuilder, GroupError, ResultTaskGroup, TryGroupBuilder, TryTaskGroup};
 pub use crate::options::{PoolBuilder, QueueSize};
 pub use crate::pool::{Pool, StopHandle, TaskHandle};
-pub use crate::subpool::Subpool;
+pub use crate::submit::TaskSink;
+pub use crate::subpool::{Subpool, SubpoolBuilder};
 
 // Process-wide default pool (Tokio only).
 #[cfg(feature = "runtime-tokio")]

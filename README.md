@@ -1,10 +1,11 @@
-# pond (Rust)
+# pond-rs
 
-An idiomatic, runtime-agnostic worker pool for Rust — a from-scratch rewrite of the Go
-[`pond`](https://github.com/alitto/pond) library.
+An idiomatic, runtime-agnostic worker pool for Rust.
 
-> **Status:** under active development (Rust port). The original Go sources remain in this
-> repository for reference until the Rust implementation reaches parity.
+> Inspired by Pond, a Go worker-pool library — this is an independent Rust project, not a
+> binding or a port.
+>
+> The package is published as `pond-rs`; the library is imported as `pond` (`use pond::…`).
 
 ## Features
 
@@ -14,6 +15,11 @@ An idiomatic, runtime-agnostic worker pool for Rust — a from-scratch rewrite o
   default `runtime-tokio` feature; other runtimes (async-std, smol, …) can be added later.
 - Task **handles** (awaitable futures), **task groups**, **subpools**, dynamic **resize**,
   graceful **shutdown**, **cancellation**, and rich **metrics**.
+- **Context integration**: bridge any external cancellation source or deadline into the pool, and
+  hand each task a `TaskContext` to break early or carry/stream data.
+- **Concurrency partitioning**: cap a group or subpool to a slice of the pool (e.g. on a pool of
+  100, give a group 10 and leave 90 for everything else).
+- **Min/max workers**: the blocking pool runs a genuine core/max thread model with idle keep-alive.
 
 ## Quick start
 
@@ -29,6 +35,50 @@ async fn main() {
 
     pool.stop_and_wait().await;
 }
+```
+
+## Context, partitioning & worker limits
+
+```rust
+use std::time::Duration;
+use pond::Pool;
+
+#[tokio::main]
+async fn main() {
+    // Shut the pool down on an external signal or a deadline.
+    let pool = Pool::builder()
+        .max_concurrency(100)
+        .deadline(Duration::from_secs(30))   // or .cancel_when(some_future)
+        .build();
+
+    // A group that may use at most 10 of the 100 workers (90 stay free).
+    let mut group = pool.group_builder::<u64>().max_concurrency(10).build();
+    for i in 0..50 { group.submit(move || async move { i * 2 }); }
+    let _results = group.wait().await.unwrap();
+
+    // A task that receives a context — break early when cancelled.
+    let h = pool.submit_ctx(|ctx| async move {
+        if ctx.is_cancelled() { return 0; }
+        42
+    });
+    let _ = h.await;
+}
+```
+
+```rust
+use std::time::Duration;
+use pond::blocking::Pool;
+
+// Blocking pool with a real core/max thread model: 2 always-alive threads,
+// growing to 16 under load, extra threads retiring after 30s idle.
+let pool = Pool::builder()
+    .min_concurrency(2)
+    .max_concurrency(16)
+    .keep_alive(Duration::from_secs(30))
+    .build();
+let handle = pool.submit(|| expensive_blocking_work());
+let _ = handle.wait();
+# fn expensive_blocking_work() -> u32 { 1 }
 ```
 
 ## Cargo features

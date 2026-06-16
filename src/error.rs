@@ -3,9 +3,6 @@
 use std::fmt;
 
 /// Errors produced when submitting or awaiting tasks.
-///
-/// This is the Rust counterpart of pond's sentinel errors (`ErrQueueFull`,
-/// `ErrPoolStopped`, `ErrContextCanceled`, `ErrPanic`, `ErrGroupStopped`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {

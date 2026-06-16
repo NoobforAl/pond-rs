@@ -1,21 +1,23 @@
 //! Task groups: submit many related tasks and wait for them together.
 //!
-//! Mirrors pond's `TaskGroup` / `ResultTaskGroup`:
-//!
 //! * [`ResultTaskGroup`] collects task outputs **in submission order**.
 //! * [`TryTaskGroup`] additionally short-circuits: the first failing task (a
 //!   returned `Err` or a panic) cancels the remaining *queued* tasks (in-flight
-//!   tasks are allowed to finish, just like pond).
+//!   tasks are allowed to finish).
 //!
 //! A group owns its own [`CancelToken`], so cancelling a group never affects the
 //! parent pool.
 
 use std::future::Future;
+use std::marker::PhantomData;
 
 use crate::cancel::CancelToken;
+use crate::context::TaskContext;
 use crate::error::Error;
 use crate::pool::{Pool, TaskHandle};
 use crate::runtime::Spawner;
+use crate::submit::TaskSink;
+use crate::subpool::Subpool;
 
 /// What happened to a single group task once a worker reached it.
 enum Outcome<V> {
@@ -48,17 +50,21 @@ impl<E: std::fmt::Debug + std::fmt::Display> std::error::Error for GroupError<E>
 /// A group of tasks whose outputs are collected in submission order.
 ///
 /// Create one with [`Pool::group`].
-pub struct ResultTaskGroup<S: Spawner, T> {
-    pool: Pool<S>,
+pub struct ResultTaskGroup<P: TaskSink, T> {
+    pool: P,
     token: CancelToken,
     handles: Vec<TaskHandle<Outcome<T>>>,
 }
 
-impl<S: Spawner, T: Send + 'static> ResultTaskGroup<S, T> {
-    pub(crate) fn new(pool: Pool<S>) -> Self {
+impl<P: TaskSink, T: Send + 'static> ResultTaskGroup<P, T> {
+    pub(crate) fn new(pool: P) -> Self {
+        Self::new_with_token(pool, CancelToken::new())
+    }
+
+    pub(crate) fn new_with_token(pool: P, token: CancelToken) -> Self {
         Self {
             pool,
-            token: CancelToken::new(),
+            token,
             handles: Vec::new(),
         }
     }
@@ -79,6 +85,17 @@ impl<S: Spawner, T: Send + 'static> ResultTaskGroup<S, T> {
         });
         self.handles.push(handle);
         self
+    }
+
+    /// Submits a task that receives a [`TaskContext`] bound to the group's
+    /// cancel token (so it can observe group cancellation). Chainable.
+    pub fn submit_ctx<F, Fut>(&mut self, task: F) -> &mut Self
+    where
+        F: FnOnce(TaskContext) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+    {
+        let ctx = TaskContext::new(self.token.clone(), self.pool.task_data());
+        self.submit(move || task(ctx))
     }
 
     /// Returns the group's [`CancelToken`].
@@ -128,18 +145,22 @@ impl<S: Spawner, T: Send + 'static> ResultTaskGroup<S, T> {
 /// A group of fallible tasks that short-circuits on the first error.
 ///
 /// Create one with [`Pool::try_group`].
-pub struct TryTaskGroup<S: Spawner, T, E> {
-    pool: Pool<S>,
+pub struct TryTaskGroup<P: TaskSink, T, E> {
+    pool: P,
     token: CancelToken,
     #[allow(clippy::type_complexity)]
     handles: Vec<TaskHandle<Outcome<Result<T, E>>>>,
 }
 
-impl<S: Spawner, T: Send + 'static, E: Send + 'static> TryTaskGroup<S, T, E> {
-    pub(crate) fn new(pool: Pool<S>) -> Self {
+impl<P: TaskSink, T: Send + 'static, E: Send + 'static> TryTaskGroup<P, T, E> {
+    pub(crate) fn new(pool: P) -> Self {
+        Self::new_with_token(pool, CancelToken::new())
+    }
+
+    pub(crate) fn new_with_token(pool: P, token: CancelToken) -> Self {
         Self {
             pool,
-            token: CancelToken::new(),
+            token,
             handles: Vec::new(),
         }
     }
@@ -160,6 +181,17 @@ impl<S: Spawner, T: Send + 'static, E: Send + 'static> TryTaskGroup<S, T, E> {
         });
         self.handles.push(handle);
         self
+    }
+
+    /// Submits a fallible task that receives a [`TaskContext`] bound to the
+    /// group's cancel token. Chainable.
+    pub fn submit_ctx<F, Fut>(&mut self, task: F) -> &mut Self
+    where
+        F: FnOnce(TaskContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+    {
+        let ctx = TaskContext::new(self.token.clone(), self.pool.task_data());
+        self.submit(move || task(ctx))
     }
 
     /// Returns the group's [`CancelToken`].
@@ -212,5 +244,101 @@ impl<S: Spawner, T: Send + 'static, E: Send + 'static> TryTaskGroup<S, T, E> {
             Some(e) => Err(e),
             None => Ok(out),
         }
+    }
+}
+
+/// Builder for a [`ResultTaskGroup`] with a concurrency cap and/or an external
+/// cancel token.
+///
+/// A capped group runs on a dedicated [`Subpool`] of the parent pool, so it can
+/// only use up to `max_concurrency` of the parent's workers — e.g. on a pool of
+/// 100, `max_concurrency(10)` leaves 90 workers for everything else.
+pub struct GroupBuilder<S: Spawner, T> {
+    parent: Pool<S>,
+    max_concurrency: usize,
+    cancel_token: Option<CancelToken>,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<S: Spawner, T: Send + 'static> GroupBuilder<S, T> {
+    pub(crate) fn new(parent: Pool<S>) -> Self {
+        Self {
+            parent,
+            max_concurrency: 0,
+            cancel_token: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Caps how many of the group's tasks may run at once (`0` = inherit the
+    /// parent's limit).
+    pub fn max_concurrency(mut self, max: usize) -> Self {
+        self.max_concurrency = max;
+        self
+    }
+
+    /// Uses an external [`CancelToken`] for the group (e.g. to tie it to a
+    /// request context). The analogue of Go pond's `NewGroupContext`.
+    pub fn cancel_token(mut self, token: CancelToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+
+    /// Builds the group.
+    pub fn build(self) -> ResultTaskGroup<Subpool<S>, T> {
+        let sub = Subpool::from_parts(
+            self.parent,
+            self.max_concurrency,
+            usize::MAX,
+            false,
+            CancelToken::new(),
+        );
+        let token = self.cancel_token.unwrap_or_default();
+        ResultTaskGroup::new_with_token(sub, token)
+    }
+}
+
+/// Builder for a [`TryTaskGroup`] with a concurrency cap and/or an external
+/// cancel token. See [`GroupBuilder`].
+pub struct TryGroupBuilder<S: Spawner, T, E> {
+    parent: Pool<S>,
+    max_concurrency: usize,
+    cancel_token: Option<CancelToken>,
+    _marker: PhantomData<fn() -> (T, E)>,
+}
+
+impl<S: Spawner, T: Send + 'static, E: Send + 'static> TryGroupBuilder<S, T, E> {
+    pub(crate) fn new(parent: Pool<S>) -> Self {
+        Self {
+            parent,
+            max_concurrency: 0,
+            cancel_token: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Caps how many of the group's tasks may run at once (`0` = inherit).
+    pub fn max_concurrency(mut self, max: usize) -> Self {
+        self.max_concurrency = max;
+        self
+    }
+
+    /// Uses an external [`CancelToken`] for the group.
+    pub fn cancel_token(mut self, token: CancelToken) -> Self {
+        self.cancel_token = Some(token);
+        self
+    }
+
+    /// Builds the group.
+    pub fn build(self) -> TryTaskGroup<Subpool<S>, T, E> {
+        let sub = Subpool::from_parts(
+            self.parent,
+            self.max_concurrency,
+            usize::MAX,
+            false,
+            CancelToken::new(),
+        );
+        let token = self.cancel_token.unwrap_or_default();
+        TryTaskGroup::new_with_token(sub, token)
     }
 }

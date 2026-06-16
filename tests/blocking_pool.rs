@@ -144,3 +144,89 @@ fn pool_clone_shares_state() {
     assert_eq!(pool.submitted_tasks(), 1);
     pool.stop_and_wait();
 }
+
+#[test]
+fn core_max_threads_grow_under_load_then_retire() {
+    let pool = Pool::builder()
+        .min_concurrency(1)
+        .max_concurrency(4)
+        .keep_alive(Duration::from_millis(50))
+        .build();
+    assert_eq!(pool.min_concurrency(), 1);
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        handles.push(pool.submit(|| std::thread::sleep(Duration::from_millis(100))));
+    }
+    // While the 4 tasks run, the pool should have grown beyond its core size.
+    std::thread::sleep(Duration::from_millis(40));
+    let peak = pool.live_workers();
+    assert!(peak > 1, "expected growth beyond core, live={peak}");
+    assert!(peak <= 4);
+
+    for h in handles {
+        h.wait().unwrap();
+    }
+    // Idle non-core threads retire after the keep-alive window.
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        pool.live_workers() <= 2,
+        "expected retirement toward core, live={}",
+        pool.live_workers()
+    );
+    pool.stop_and_wait();
+}
+
+#[test]
+fn cancel_abandons_queued_tasks() {
+    let pool = Pool::new(1);
+    let barrier = Arc::new(Barrier::new(2));
+    let b = barrier.clone();
+    let busy = pool.submit(move || {
+        b.wait();
+    });
+    std::thread::sleep(Duration::from_millis(20));
+
+    let queued: Vec<_> = (0..5).map(|i| pool.submit(move || i)).collect();
+    pool.cancel();
+    barrier.wait();
+    busy.wait().unwrap();
+
+    for h in queued {
+        assert_eq!(h.wait(), Err(Error::Canceled));
+    }
+    assert!(pool.canceled_tasks() >= 1);
+}
+
+#[test]
+fn group_collects_ordered_results() {
+    let pool = Pool::new(4);
+    let mut g = pool.group::<usize>();
+    for i in 0..10 {
+        g.submit(move || i * 2);
+    }
+    let results = g.wait().unwrap();
+    assert_eq!(results, (0..10).map(|i| i * 2).collect::<Vec<_>>());
+    pool.stop_and_wait();
+}
+
+#[test]
+fn try_group_aborts_on_first_error() {
+    use pond::GroupError;
+    let pool = Pool::new(2);
+    let mut g = pool.try_group::<usize, String>();
+    for i in 0..10 {
+        g.submit(move || {
+            if i == 3 {
+                Err(format!("bad {i}"))
+            } else {
+                Ok(i)
+            }
+        });
+    }
+    match g.wait() {
+        Err(GroupError::Task(msg)) => assert!(msg.contains("bad 3")),
+        other => panic!("expected task error, got {other:?}"),
+    }
+    pool.stop_and_wait();
+}

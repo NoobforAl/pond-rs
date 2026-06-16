@@ -1,5 +1,6 @@
 //! The async worker [`Pool`].
 
+use std::any::Any;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -9,15 +10,18 @@ use std::task::{Context, Poll};
 
 use event_listener::Event;
 use futures::channel::oneshot;
+use futures::future::BoxFuture;
 use futures::FutureExt;
 
 use crate::cancel::CancelToken;
+use crate::context::TaskContext;
 use crate::error::{panic_message, Error, Result};
-use crate::group::{ResultTaskGroup, TryTaskGroup};
+use crate::group::{GroupBuilder, ResultTaskGroup, TryGroupBuilder, TryTaskGroup};
 use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::options::PoolBuilder;
 use crate::runtime::Spawner;
-use crate::subpool::Subpool;
+use crate::submit::TaskSink;
+use crate::subpool::{Subpool, SubpoolBuilder};
 
 #[cfg(feature = "runtime-tokio")]
 use crate::runtime::TokioSpawner;
@@ -48,6 +52,7 @@ struct Inner<S: Spawner> {
     // When false, concurrency is unbounded and permits are skipped.
     limited: AtomicBool,
     max_concurrency: AtomicUsize, // 0 == unbounded
+    min_concurrency: usize,       // resize floor (0 == none)
     capacity: usize,              // queue capacity (usize::MAX == unbounded)
     panic_recovery: bool,
     non_blocking: bool,
@@ -56,6 +61,7 @@ struct Inner<S: Spawner> {
     metrics: Metrics,
     idle: Event, // notified when the pool becomes fully idle
     slot: Event, // notified when a queue slot frees up
+    task_data: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 #[cfg(feature = "runtime-tokio")]
@@ -76,7 +82,10 @@ impl<S: Spawner> Pool<S> {
         PoolBuilder::new(spawner)
     }
 
-    pub(crate) fn from_builder(b: PoolBuilder<S>) -> Self {
+    pub(crate) fn from_builder(mut b: PoolBuilder<S>) -> Self {
+        let cancel_when = b.cancel_when.take();
+        let deadline = b.deadline.take();
+        let task_data = b.task_data.take();
         let limited = b.max_concurrency != 0;
         // An unbounded token channel: `send` never blocks, so releasing a permit
         // is always immediate.
@@ -93,6 +102,7 @@ impl<S: Spawner> Pool<S> {
             permit_rx,
             limited: AtomicBool::new(limited),
             max_concurrency: AtomicUsize::new(b.max_concurrency),
+            min_concurrency: b.min_concurrency,
             capacity: b.queue_size.capacity(),
             panic_recovery: b.panic_recovery,
             non_blocking: b.non_blocking,
@@ -101,6 +111,7 @@ impl<S: Spawner> Pool<S> {
             metrics: Metrics::new(),
             idle: Event::new(),
             slot: Event::new(),
+            task_data,
         });
 
         // Watch the cancel token: when it fires, stop accepting tasks and wake
@@ -116,6 +127,17 @@ impl<S: Spawner> Pool<S> {
             watch.slot.notify(usize::MAX);
             watch.idle.notify(usize::MAX);
         }));
+
+        // Bridge external cancellation sources into the pool's cancel token.
+        if let Some(fut) = cancel_when {
+            inner.cancel.cancel_on(&inner.spawner, fut);
+        }
+        #[cfg(feature = "runtime-tokio")]
+        if let Some(dur) = deadline {
+            inner.cancel.cancel_after(&inner.spawner, dur);
+        }
+        #[cfg(not(feature = "runtime-tokio"))]
+        let _ = deadline;
 
         Pool { inner }
     }
@@ -153,7 +175,7 @@ impl<S: Spawner> Pool<S> {
 
     /// Submits a task fire-and-forget, discarding its result handle.
     ///
-    /// The analogue of pond's `Go`. The task still runs; only the handle (and
+    /// Fire-and-forget submission. The task still runs; only the handle (and
     /// therefore the result) is dropped.
     pub fn spawn<F, Fut, T>(&self, task: F)
     where
@@ -163,6 +185,48 @@ impl<S: Spawner> Pool<S> {
     {
         let handle = self.submit(task);
         drop(handle);
+    }
+
+    /// Submits a task that receives a [`TaskContext`], returning a handle.
+    ///
+    /// The context lets the task observe cancellation (to break out early) and
+    /// read shared data attached via
+    /// [`PoolBuilder::task_data`](crate::PoolBuilder::task_data).
+    pub fn submit_ctx<F, Fut, T>(&self, task: F) -> TaskHandle<T>
+    where
+        F: FnOnce(TaskContext) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let ctx = self.task_context();
+        self.submit(move || task(ctx))
+    }
+
+    /// Fire-and-forget variant of [`submit_ctx`](Self::submit_ctx).
+    pub fn spawn_ctx<F, Fut, T>(&self, task: F)
+    where
+        F: FnOnce(TaskContext) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let ctx = self.task_context();
+        self.spawn(move || task(ctx));
+    }
+
+    /// Builds a [`TaskContext`] bound to this pool's cancel token and shared data.
+    pub(crate) fn task_context(&self) -> TaskContext {
+        TaskContext::new(self.inner.cancel.clone(), self.inner.task_data.clone())
+    }
+
+    /// The shared task data attached to this pool, if any.
+    pub(crate) fn task_data(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.inner.task_data.clone()
+    }
+
+    /// Spawns a detached future on the pool's runtime, bypassing the queue,
+    /// permits and metrics. Used internally for watchers (e.g. subpools).
+    pub(crate) fn spawn_detached(&self, fut: BoxFuture<'static, ()>) {
+        self.inner.spawner.spawn(fut);
     }
 
     /// Submits a task, rejecting immediately if the pool is stopped or its
@@ -375,6 +439,12 @@ impl<S: Spawner> Pool<S> {
     )]
     pub fn resize(&self, max_concurrency: usize) {
         let inner = &self.inner;
+        // Honor the configured floor: never shrink bounded concurrency below it.
+        let max_concurrency = if max_concurrency == 0 {
+            0
+        } else {
+            max_concurrency.max(inner.min_concurrency)
+        };
         // ordering: `Relaxed` — `max_concurrency`/`limited` are config flags; the
         // permit channel below carries the actual concurrency synchronization.
         let old = inner
@@ -416,7 +486,7 @@ impl<S: Spawner> Pool<S> {
         }
     }
 
-    // --- Metrics accessors (mirror pond's BasePool) -------------------------
+    // --- Metrics accessors --------------------------------------------------
 
     /// Returns a point-in-time snapshot of all metrics.
     pub fn metrics(&self) -> MetricsSnapshot {
@@ -472,15 +542,38 @@ impl<S: Spawner> Pool<S> {
     // --- Groups & subpools --------------------------------------------------
 
     /// Creates a [`ResultTaskGroup`] whose tasks return `T`.
-    pub fn group<T: Send + 'static>(&self) -> ResultTaskGroup<S, T> {
+    pub fn group<T: Send + 'static>(&self) -> ResultTaskGroup<Pool<S>, T> {
         ResultTaskGroup::new(self.clone())
     }
 
     /// Creates a [`TryTaskGroup`] of fallible tasks returning `Result<T, E>`.
     ///
     /// The first failing task cancels the remaining queued tasks.
-    pub fn try_group<T: Send + 'static, E: Send + 'static>(&self) -> TryTaskGroup<S, T, E> {
+    pub fn try_group<T: Send + 'static, E: Send + 'static>(&self) -> TryTaskGroup<Pool<S>, T, E> {
         TryTaskGroup::new(self.clone())
+    }
+
+    /// Starts building a [`ResultTaskGroup`] with a concurrency cap and/or an
+    /// external cancel token.
+    ///
+    /// E.g. on a pool of 100, `pool.group_builder::<T>().max_concurrency(10)`
+    /// limits the group to 10 workers, leaving 90 for other work.
+    pub fn group_builder<T: Send + 'static>(&self) -> GroupBuilder<S, T> {
+        GroupBuilder::new(self.clone())
+    }
+
+    /// Starts building a [`TryTaskGroup`] with a concurrency cap and/or an
+    /// external cancel token.
+    pub fn try_group_builder<T: Send + 'static, E: Send + 'static>(
+        &self,
+    ) -> TryGroupBuilder<S, T, E> {
+        TryGroupBuilder::new(self.clone())
+    }
+
+    /// Starts building a [`Subpool`] with a concurrency cap, a bounded queue,
+    /// and/or an external cancel token.
+    pub fn subpool_builder(&self) -> SubpoolBuilder<S> {
+        SubpoolBuilder::new(self.clone())
     }
 
     /// Creates a subpool that runs on this pool but limits its own concurrency
@@ -489,7 +582,7 @@ impl<S: Spawner> Pool<S> {
     /// # Panics
     ///
     /// Panics if `max_concurrency` exceeds this pool's bound (when bounded), or
-    /// if it is zero. This matches pond's validation.
+    /// if it is zero.
     pub fn subpool(&self, max_concurrency: usize) -> Subpool<S> {
         Subpool::new(self.clone(), max_concurrency)
     }
@@ -571,10 +664,36 @@ pub struct StopHandle {
     fut: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
+impl StopHandle {
+    pub(crate) fn new(fut: Pin<Box<dyn Future<Output = ()> + Send>>) -> Self {
+        Self { fut }
+    }
+}
+
 impl Future for StopHandle {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         self.fut.as_mut().poll(cx)
+    }
+}
+
+impl<S: Spawner> TaskSink for Pool<S> {
+    fn submit<F, Fut, T>(&self, task: F) -> TaskHandle<T>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        // Inherent `Pool::submit` (takes priority over this trait method).
+        self.submit(task)
+    }
+
+    fn cancel_token(&self) -> CancelToken {
+        self.cancel_token()
+    }
+
+    fn task_data(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.task_data()
     }
 }

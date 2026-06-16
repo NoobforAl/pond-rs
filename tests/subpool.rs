@@ -85,3 +85,197 @@ async fn subpool_zero_inherits_parent_limit() {
     let sub = parent.subpool(0);
     assert_eq!(sub.max_concurrency(), 3);
 }
+
+#[tokio::test]
+async fn subpool_panic_is_recovered_and_counted() {
+    let parent = Pool::builder().max_concurrency(2).build();
+    let sub = parent.subpool(1);
+    let h = sub.submit(|| async { panic!("subpool boom") });
+    match h.await {
+        Err(pond::Error::Panicked(msg)) => assert!(msg.contains("subpool boom")),
+        other => panic!("expected Panicked, got {other:?}"),
+    }
+    assert_eq!(sub.failed_tasks(), 1);
+    // Subpool stays healthy.
+    assert_eq!(sub.submit(|| async { 7 }).await.unwrap(), 7);
+}
+
+#[tokio::test]
+async fn subpool_cancel_abandons_queued_tasks() {
+    let parent = Pool::builder().max_concurrency(4).build();
+    let sub = parent.subpool(1);
+
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let g = gate.clone();
+    let running = sub.submit(move || async move {
+        g.notified().await;
+        "done"
+    });
+    // Wait until the gate task occupies the single subpool slot.
+    for _ in 0..500 {
+        if sub.running_workers() == 1 {
+            break;
+        }
+        sleep(Duration::from_millis(2)).await;
+    }
+
+    let queued: Vec<_> = (0..5)
+        .map(|i| sub.submit(move || async move { i }))
+        .collect();
+    sub.cancel();
+    gate.notify_waiters();
+
+    assert_eq!(running.await.unwrap(), "done");
+    for h in queued {
+        assert_eq!(h.await, Err(pond::Error::Canceled));
+    }
+    assert!(sub.canceled_tasks() >= 1);
+    // Parent is unaffected.
+    assert_eq!(parent.submit(|| async { 3 }).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn subpool_try_submit_rejects_when_full() {
+    use pond::QueueSize;
+    // A bounded subpool: build via builder once Phase 4 lands; here we exercise
+    // try_submit's stopped-rejection path which is always available.
+    let parent = Pool::builder()
+        .max_concurrency(1)
+        .queue_size(QueueSize::Bounded(1))
+        .build();
+    let sub = parent.subpool(1);
+    sub.stop_and_wait().await;
+    assert!(sub.try_submit(|| async { 1 }).is_err());
+}
+
+#[tokio::test]
+async fn subpool_group_collects_ordered_results() {
+    let parent = Pool::builder().max_concurrency(8).build();
+    let sub = parent.subpool(2);
+    let mut group = sub.group::<usize>();
+    for i in 0..10usize {
+        group.submit(move || async move {
+            sleep(Duration::from_millis((10 - i) as u64)).await;
+            i * 3
+        });
+    }
+    let results = group.wait().await.unwrap();
+    assert_eq!(results, (0..10).map(|i| i * 3).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn group_builder_caps_concurrency_for_partitioning() {
+    // Pool of 100; a group limited to 10 — leaving 90 for other work.
+    let pool = Pool::builder().max_concurrency(100).build();
+    let current = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+
+    let mut group = pool.group_builder::<()>().max_concurrency(10).build();
+    for _ in 0..60 {
+        let current = current.clone();
+        let peak = peak.clone();
+        group.submit(move || async move {
+            let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            sleep(Duration::from_millis(5)).await;
+            current.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+    group.wait().await.unwrap();
+    assert!(
+        peak.load(Ordering::SeqCst) <= 10,
+        "group peak {} exceeded cap 10",
+        peak.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn subpool_builder_bounded_queue_rejects_when_full() {
+    use pond::QueueSize;
+    let parent = Pool::builder().max_concurrency(1).build();
+    let sub = parent
+        .subpool_builder()
+        .max_concurrency(1)
+        .queue_size(QueueSize::Bounded(1))
+        .non_blocking(true)
+        .build();
+
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let g = gate.clone();
+    let _busy = sub.submit(move || async move {
+        g.notified().await;
+    });
+    for _ in 0..500 {
+        if sub.running_workers() == 1 {
+            break;
+        }
+        sleep(Duration::from_millis(2)).await;
+    }
+
+    let _queued = sub.submit(|| async {}); // fills the 1-slot queue
+    let rejected = sub.submit(|| async { 9 });
+    assert_eq!(rejected.await, Err(pond::Error::QueueFull));
+    assert!(sub.dropped_tasks() >= 1);
+
+    gate.notify_waiters();
+}
+
+#[tokio::test]
+async fn subpool_builder_external_cancel_token() {
+    use pond::CancelToken;
+    let parent = Pool::builder().max_concurrency(4).build();
+    let token = CancelToken::new();
+    let sub = parent
+        .subpool_builder()
+        .max_concurrency(2)
+        .cancel_token(token.clone())
+        .build();
+
+    // Cancelling the external token stops the subpool.
+    token.cancel();
+    assert!(sub.is_stopped());
+    assert_eq!(sub.submit(|| async { 1 }).await, Err(pond::Error::Canceled));
+    // Parent unaffected.
+    assert_eq!(parent.submit(|| async { 5 }).await.unwrap(), 5);
+}
+
+#[tokio::test]
+async fn min_concurrency_is_a_resize_floor() {
+    let pool = Pool::builder()
+        .max_concurrency(8)
+        .min_concurrency(4)
+        .build();
+    pool.resize(1);
+    assert_eq!(pool.max_concurrency(), 4); // clamped up to the floor
+    pool.resize(6);
+    assert_eq!(pool.max_concurrency(), 6);
+    pool.resize(0);
+    assert_eq!(pool.max_concurrency(), 0); // explicit unbounded still allowed
+}
+
+#[tokio::test]
+async fn subpool_resize_grows_concurrency() {
+    let parent = Pool::builder().max_concurrency(8).build();
+    let sub = parent.subpool(1);
+    sub.resize(4);
+    assert_eq!(sub.max_concurrency(), 4);
+
+    let current = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let current = current.clone();
+        let peak = peak.clone();
+        handles.push(sub.submit(move || async move {
+            let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            sleep(Duration::from_millis(5)).await;
+            current.fetch_sub(1, Ordering::SeqCst);
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    assert!(peak.load(Ordering::SeqCst) > 1);
+    assert!(peak.load(Ordering::SeqCst) <= 4);
+}

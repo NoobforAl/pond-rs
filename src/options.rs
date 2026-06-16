@@ -1,12 +1,17 @@
 //! Pool configuration and the [`PoolBuilder`].
 
+use std::any::Any;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::future::BoxFuture;
+
 use crate::cancel::CancelToken;
 use crate::pool::Pool;
 use crate::runtime::Spawner;
 
 /// The capacity of a pool's task queue (tasks accepted but not yet running).
-///
-/// Mirrors pond's `WithQueueSize` / `Unbounded`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QueueSize {
     /// No limit on the number of queued tasks (the default).
@@ -39,10 +44,14 @@ impl From<usize> for QueueSize {
 pub struct PoolBuilder<S: Spawner> {
     pub(crate) spawner: S,
     pub(crate) max_concurrency: usize,
+    pub(crate) min_concurrency: usize,
     pub(crate) queue_size: QueueSize,
     pub(crate) non_blocking: bool,
     pub(crate) panic_recovery: bool,
     pub(crate) cancel_token: CancelToken,
+    pub(crate) cancel_when: Option<BoxFuture<'static, ()>>,
+    pub(crate) deadline: Option<Duration>,
+    pub(crate) task_data: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl<S: Spawner> PoolBuilder<S> {
@@ -50,18 +59,33 @@ impl<S: Spawner> PoolBuilder<S> {
         Self {
             spawner,
             max_concurrency: 0, // 0 == unbounded concurrency
+            min_concurrency: 0,
             queue_size: QueueSize::Unbounded,
             non_blocking: false,
             panic_recovery: true,
             cancel_token: CancelToken::new(),
+            cancel_when: None,
+            deadline: None,
+            task_data: None,
         }
     }
 
     /// Sets the maximum number of tasks that may run concurrently.
     ///
-    /// `0` means unbounded concurrency (the default), matching pond.
+    /// `0` means unbounded concurrency (the default).
     pub fn max_concurrency(mut self, max: usize) -> Self {
         self.max_concurrency = max;
+        self
+    }
+
+    /// Sets a floor for concurrency: [`resize`](crate::Pool::resize) will not
+    /// drop the bounded concurrency below this value.
+    ///
+    /// For the async pool, workers are ephemeral, so this is a *floor* rather
+    /// than a count of always-running threads. The blocking pool honors it as a
+    /// genuine core-thread count.
+    pub fn min_concurrency(mut self, min: usize) -> Self {
+        self.min_concurrency = min;
         self
     }
 
@@ -89,10 +113,45 @@ impl<S: Spawner> PoolBuilder<S> {
         self
     }
 
-    /// Supplies an external [`CancelToken`], allowing shared cancellation
-    /// (the analogue of pond's `WithContext`).
+    /// Supplies an external [`CancelToken`], allowing shared cancellation.
     pub fn cancel_token(mut self, token: CancelToken) -> Self {
         self.cancel_token = token;
+        self
+    }
+
+    /// Shuts the pool down when `fut` completes.
+    ///
+    /// Bridges any external cancellation source into the pool — e.g. a
+    /// `tokio_util::sync::CancellationToken`'s `cancelled()` future, a
+    /// request-scoped future, or a `oneshot` receiver. The future's output is
+    /// ignored. This is the analogue of passing a cancellable `context.Context`.
+    pub fn cancel_when<F>(mut self, fut: F) -> Self
+    where
+        F: Future + Send + 'static,
+        F::Output: Send,
+    {
+        self.cancel_when = Some(Box::pin(async move {
+            let _ = fut.await;
+        }));
+        self
+    }
+
+    /// Shuts the pool down after `dur` elapses (a deadline).
+    ///
+    /// Requires the `runtime-tokio` feature (uses Tokio's timer); a no-op
+    /// otherwise.
+    pub fn deadline(mut self, dur: Duration) -> Self {
+        self.deadline = Some(dur);
+        self
+    }
+
+    /// Attaches shared data made available to tasks via
+    /// [`TaskContext::data`](crate::TaskContext::data).
+    ///
+    /// A common use is to stash an `Arc<async_channel::Sender<T>>` so tasks
+    /// submitted with `submit_ctx` can stream results out.
+    pub fn task_data(mut self, data: Arc<dyn Any + Send + Sync>) -> Self {
+        self.task_data = Some(data);
         self
     }
 

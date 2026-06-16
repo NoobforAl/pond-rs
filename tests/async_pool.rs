@@ -1,4 +1,4 @@
-//! Integration tests for the async [`Pool`], porting pond's behavior suite.
+//! Integration tests for the async [`Pool`].
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -325,4 +325,61 @@ async fn pool_is_cloneable_and_shares_state() {
     let clone = pool.clone();
     clone.submit(|| async {}).await.unwrap();
     assert_eq!(pool.submitted_tasks(), 1);
+}
+
+#[tokio::test]
+async fn cancel_when_future_shuts_down_pool() {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let pool = Pool::builder()
+        .max_concurrency(1)
+        .cancel_when(async move {
+            let _ = rx.await;
+        })
+        .build();
+    assert!(!pool.is_stopped());
+
+    // Fire the external signal; the pool should observe cancellation.
+    let _ = tx.send(());
+    wait_until({
+        let pool = pool.clone();
+        move || pool.is_stopped()
+    })
+    .await;
+
+    let h = pool.submit(|| async { 1 });
+    assert_eq!(h.await, Err(Error::Canceled));
+}
+
+#[tokio::test]
+async fn deadline_cancels_pending_work() {
+    let pool = Pool::builder()
+        .max_concurrency(1)
+        .deadline(Duration::from_millis(20))
+        .build();
+
+    // Occupy the single worker so the rest stay queued past the deadline.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let g = gate.clone();
+    let busy = pool.submit(move || async move {
+        g.notified().await;
+    });
+    wait_until({
+        let pool = pool.clone();
+        move || pool.running_workers() == 1
+    })
+    .await;
+
+    let queued: Vec<_> = (0..3)
+        .map(|i| pool.submit(move || async move { i }))
+        .collect();
+
+    // Let the deadline elapse, then release the busy worker.
+    sleep(Duration::from_millis(50)).await;
+    gate.notify_waiters();
+    let _ = busy.await;
+
+    assert!(pool.is_stopped());
+    for h in queued {
+        assert_eq!(h.await, Err(Error::Canceled));
+    }
 }

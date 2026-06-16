@@ -1,8 +1,8 @@
 //! A process-wide default pool and package-level convenience functions.
 //!
-//! Mirrors pond's default pool: a lazily-initialized, unbounded pool reachable
-//! through free functions. Requires the `runtime-tokio` feature and must first
-//! be used from within a Tokio runtime.
+//! A lazily-initialized, unbounded pool reachable through free functions.
+//! Requires the `runtime-tokio` feature and must first be used from within a
+//! Tokio runtime.
 
 use std::future::Future;
 use std::sync::OnceLock;
@@ -34,12 +34,12 @@ where
 }
 
 /// Creates a [`ResultTaskGroup`] on the default pool.
-pub fn group<T: Send + 'static>() -> ResultTaskGroup<TokioSpawner, T> {
+pub fn group<T: Send + 'static>() -> ResultTaskGroup<Pool<TokioSpawner>, T> {
     default_pool().group()
 }
 
 /// Creates a [`TryTaskGroup`] on the default pool.
-pub fn try_group<T: Send + 'static, E: Send + 'static>() -> TryTaskGroup<TokioSpawner, T, E> {
+pub fn try_group<T: Send + 'static, E: Send + 'static>() -> TryTaskGroup<Pool<TokioSpawner>, T, E> {
     default_pool().try_group()
 }
 
