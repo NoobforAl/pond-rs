@@ -1,0 +1,81 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  # `tokio-console` requires `--cfg tokio_unstable`, so it cannot be part of
+  # `--all-features`. The standard jobs use this safe set instead; a dedicated
+  # step below compiles the tokio-console path with the unstable flag set.
+  SAFE_FEATURES: "runtime-tokio,blocking,tracing"
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --features "$SAFE_FEATURES" --verbose
+      - name: Test (safe features)
+        run: cargo test --features "$SAFE_FEATURES" --verbose
+      - name: Test (no default features)
+        run: cargo test --no-default-features --features runtime-tokio --verbose
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets --features "$SAFE_FEATURES" -- -D warnings
+      - name: benches (compile only)
+        run: cargo bench --features "$SAFE_FEATURES" --no-run
+      - name: tokio-console feature (compile only)
+        run: cargo build --features tokio-console
+        env:
+          RUSTFLAGS: "--cfg tokio_unstable -D warnings"
+      - name: docs
+        run: cargo doc --no-deps --features "$SAFE_FEATURES"
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Generate coverage
+        run: cargo llvm-cov --features "$SAFE_FEATURES" --lcov --output-path lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

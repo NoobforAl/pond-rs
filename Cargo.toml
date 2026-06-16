@@ -1,0 +1,82 @@
+[package]
+name = "pond"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "An idiomatic, runtime-agnostic async + blocking worker pool for Rust (a Rust rewrite of the Go `pond` library)."
+license = "MIT"
+repository = "https://github.com/alitto/pond"
+readme = "README.md"
+keywords = ["pool", "worker", "concurrency", "async", "tokio"]
+categories = ["concurrency", "asynchronous"]
+
+[features]
+default = ["runtime-tokio", "blocking"]
+# Async pool runtime adapters.
+runtime-tokio = ["dep:tokio"]
+# Synchronous, std::thread-based blocking pool.
+blocking = ["dep:crossbeam-channel"]
+# Debug/monitoring: emit `tracing` spans and events so you can observe task
+# timing and pool behavior in tests and during debugging. Leave this OFF in
+# production — with the feature disabled every instrumentation site compiles
+# away to nothing (zero runtime cost).
+tracing = ["dep:tracing"]
+# Live async task monitoring via tokio-console. Implies `tracing` and enables
+# Tokio's task instrumentation. NOTE: requires building with
+# `RUSTFLAGS="--cfg tokio_unstable"`.
+tokio-console = ["tracing", "dep:console-subscriber", "tokio?/tracing"]
+
+[dependencies]
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+async-channel = "2"
+event-listener = "5"
+pin-project-lite = "0.2"
+
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
+crossbeam-channel = { version = "0.5", optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
+console-subscriber = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+futures = { version = "0.3", features = ["executor"] }
+criterion = "0.5"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+[[bench]]
+name = "pool_bench"
+harness = false
+
+# Workload-shaped benchmarks (CPU-bound, concurrency scaling, I/O-like yielding,
+# multi-producer contention).
+[[bench]]
+name = "workload_bench"
+harness = false
+
+# Optimized profiles for this crate's own benches/examples/tests. Downstream
+# consumers control their own profiles; see README.md for guidance.
+# NOTE: deliberately NOT `panic = "abort"` — pool panic-recovery relies on
+# unwinding (`catch_unwind`), which `abort` would silently break.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+
+# `tokio-console` is excluded here because it requires `--cfg tokio_unstable`.
+[package.metadata.docs.rs]
+features = ["runtime-tokio", "blocking", "tracing"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Centralized lint configuration (the project's linter settings).
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+# `tokio_unstable` is a cfg set externally (via RUSTFLAGS) for the tokio-console feature.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
