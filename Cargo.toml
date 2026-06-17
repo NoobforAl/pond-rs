@@ -42,10 +42,13 @@ tracing = { version = "0.1", default-features = false, features = ["std", "attri
 console-subscriber = { version = "0.5.0", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "fs", "test-util"] }
 futures = { version = "0.3", features = ["executor"] }
 criterion = "0.8.2"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# SQLite for the database-workload integration tests (`tests/sqlite.rs`). The
+# `bundled` feature compiles SQLite from source so no system library is needed.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 [[bench]]
 name = "pool_bench"

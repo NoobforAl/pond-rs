@@ -254,6 +254,61 @@ async fn min_concurrency_is_a_resize_floor() {
 }
 
 #[tokio::test]
+async fn multi_tenant_isolation_caps_each_tenant() {
+    // Shared pool of 12 workers, two tenants each capped at 4. Tenant A bursts
+    // hard; tenant B submits a modest set. Neither may exceed its own cap, and
+    // A's burst must not starve B out of its slice.
+    let pool = Pool::builder().max_concurrency(12).build();
+    let tenant_a = pool.subpool_builder().max_concurrency(4).build();
+    let tenant_b = pool.subpool_builder().max_concurrency(4).build();
+
+    // Per-tenant peak trackers (same pattern as the partitioning test above).
+    let a_cur = Arc::new(AtomicUsize::new(0));
+    let a_peak = Arc::new(AtomicUsize::new(0));
+    let b_cur = Arc::new(AtomicUsize::new(0));
+    let b_peak = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..40 {
+        let cur = a_cur.clone();
+        let peak = a_peak.clone();
+        handles.push(tenant_a.submit(move || async move {
+            let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            sleep(Duration::from_millis(5)).await;
+            cur.fetch_sub(1, Ordering::SeqCst);
+        }));
+    }
+    for _ in 0..10 {
+        let cur = b_cur.clone();
+        let peak = b_peak.clone();
+        handles.push(tenant_b.submit(move || async move {
+            let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            sleep(Duration::from_millis(5)).await;
+            cur.fetch_sub(1, Ordering::SeqCst);
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let a = a_peak.load(Ordering::SeqCst);
+    let b = b_peak.load(Ordering::SeqCst);
+    assert!(a <= 4, "tenant A peak {a} exceeded its cap 4");
+    assert!(b <= 4, "tenant B peak {b} exceeded its cap 4");
+    // Tenant B was not starved by A's burst: all its jobs ran and completed.
+    assert!(b >= 1, "tenant B never ran — starved by tenant A");
+    assert_eq!(tenant_b.completed_tasks(), 10);
+    // Combined demand can't exceed the shared pool's total capacity.
+    assert!(
+        a + b <= 12,
+        "combined peak {} exceeded shared cap 12",
+        a + b
+    );
+}
+
+#[tokio::test]
 async fn subpool_resize_grows_concurrency() {
     let parent = Pool::builder().max_concurrency(8).build();
     let sub = parent.subpool(1);

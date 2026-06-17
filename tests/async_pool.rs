@@ -350,6 +350,31 @@ async fn cancel_when_future_shuts_down_pool() {
     assert_eq!(h.await, Err(Error::Canceled));
 }
 
+#[tokio::test(start_paused = true)]
+async fn long_running_tasks_complete_under_virtual_time() {
+    // Each task "sleeps" for 10 minutes. With Tokio's paused clock, virtual time
+    // auto-advances once every task is parked on its timer, so the whole test
+    // finishes in milliseconds while still exercising long-duration waits.
+    let pool = Pool::builder().max_concurrency(4).build();
+
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            pool.submit(move || async move {
+                sleep(Duration::from_secs(10 * 60)).await; // 10 minutes
+                i
+            })
+        })
+        .collect();
+
+    let mut got = Vec::new();
+    for h in handles {
+        got.push(h.await.unwrap());
+    }
+    got.sort_unstable();
+    assert_eq!(got, vec![0, 1, 2, 3]);
+    pool.stop_and_wait().await;
+}
+
 #[tokio::test]
 async fn deadline_cancels_pending_work() {
     let pool = Pool::builder()

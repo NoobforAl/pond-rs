@@ -175,11 +175,64 @@ fn multi_producer(c: &mut Criterion) {
     group.finish();
 }
 
+/// Partitioned throughput: a shared pool of 16 workers split into `tenants`
+/// equal subpools (`16 / tenants` each), every tenant running an equal share of
+/// a fixed total of CPU tasks. Measures the overhead of partitioning the same
+/// total work across N isolated tenant subpools vs. a flat pool.
+fn multi_tenant(c: &mut Criterion) {
+    let rt = rt();
+    const TOTAL: u64 = 8_000;
+    const POOL: usize = 16;
+    let mut group = c.benchmark_group("multi_tenant");
+    group.throughput(Throughput::Elements(TOTAL));
+    for &tenants in &[4usize, 8] {
+        let per_tenant = TOTAL / tenants as u64;
+        let cap = POOL / tenants;
+        group.bench_with_input(
+            BenchmarkId::from_parameter(tenants),
+            &tenants,
+            |b, &tenants| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let pool = Pool::builder().max_concurrency(POOL).build();
+                        let producers: Vec<_> = (0..tenants)
+                            .map(|t| {
+                                let sub = pool.subpool_builder().max_concurrency(cap).build();
+                                tokio::spawn(async move {
+                                    let handles: Vec<_> = (0..per_tenant)
+                                        .map(|i| {
+                                            let seed = t as u64 * per_tenant + i;
+                                            sub.submit(move || async move { cpu_work(seed) })
+                                        })
+                                        .collect();
+                                    let mut acc = 0u64;
+                                    for h in handles {
+                                        acc ^= h.await.unwrap();
+                                    }
+                                    acc
+                                })
+                            })
+                            .collect();
+                        let mut acc = 0u64;
+                        for p in producers {
+                            acc ^= p.await.unwrap();
+                        }
+                        black_box(acc);
+                        pool.stop_and_wait().await;
+                    });
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     cpu_bound,
     concurrency_scaling,
     async_yielding,
-    multi_producer
+    multi_producer,
+    multi_tenant
 );
 criterion_main!(benches);
