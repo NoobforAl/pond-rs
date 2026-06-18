@@ -26,44 +26,8 @@ async fn run_query(rows: usize) -> usize {
     rows
 }
 
-/// Tracks live and peak concurrency. Returned guard decrements on drop so the
-/// count is correct even if a task panics.
-#[derive(Clone)]
-struct ConcurrencyTracker {
-    current: Arc<AtomicUsize>,
-    peak: Arc<AtomicUsize>,
-}
-
-impl ConcurrencyTracker {
-    fn new() -> Self {
-        Self {
-            current: Arc::new(AtomicUsize::new(0)),
-            peak: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn enter(&self) -> ConcurrencyGuard {
-        let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(now, Ordering::SeqCst);
-        ConcurrencyGuard {
-            current: self.current.clone(),
-        }
-    }
-
-    fn peak(&self) -> usize {
-        self.peak.load(Ordering::SeqCst)
-    }
-}
-
-struct ConcurrencyGuard {
-    current: Arc<AtomicUsize>,
-}
-
-impl Drop for ConcurrencyGuard {
-    fn drop(&mut self) {
-        self.current.fetch_sub(1, Ordering::SeqCst);
-    }
-}
+mod common;
+use common::ConcurrencyTracker;
 
 #[tokio::test]
 async fn connection_pool_caps_concurrent_queries() {

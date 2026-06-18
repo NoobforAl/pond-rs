@@ -9,8 +9,8 @@
 # The feature set that builds without special RUSTFLAGS.
 FEATURES := runtime-tokio,blocking,tracing
 
-# Examples that need a non-default feature to compile.
-TRACING_EXAMPLES := tracing_debug
+# Examples that need a non-default feature to compile (see the per-example case
+# in the `example` target below).
 
 .DEFAULT_GOAL := help
 
@@ -37,12 +37,13 @@ test: ## Run all tests
 bench: ## Run all benchmarks
 	cargo bench
 
-# Run every example. Plain examples build on default features; the tracing
-# examples need the `tracing` feature, so they are run separately.
+# Run every example. Plain examples build on default features; a few need an
+# extra feature, mapped per-example below.
 example examples: ## Run all examples
 	@for ex in $$(ls examples/*.rs | sed -e 's|examples/||' -e 's|\.rs$$||'); do \
-		case " $(TRACING_EXAMPLES) " in \
-			*" $$ex "*) feat="--features tracing" ;; \
+		case "$$ex" in \
+			tracing_debug) feat="--features tracing" ;; \
+			metrics_export) feat="--features metrics-export" ;; \
 			*) feat="" ;; \
 		esac; \
 		echo "=== running example: $$ex ==="; \

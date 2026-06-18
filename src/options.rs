@@ -12,6 +12,15 @@ use crate::pool::Pool;
 use crate::runtime::Spawner;
 
 /// The capacity of a pool's task queue (tasks accepted but not yet running).
+///
+/// A `usize` converts to [`QueueSize::Bounded`], so builder methods accept either:
+///
+/// ```
+/// use pond::QueueSize;
+///
+/// assert_eq!(QueueSize::from(8), QueueSize::Bounded(8));
+/// assert_eq!(QueueSize::default(), QueueSize::Unbounded);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QueueSize {
     /// No limit on the number of queued tasks (the default).
@@ -138,8 +147,8 @@ impl<S: Spawner> PoolBuilder<S> {
 
     /// Shuts the pool down after `dur` elapses (a deadline).
     ///
-    /// Requires the `runtime-tokio` feature (uses Tokio's timer); a no-op
-    /// otherwise.
+    /// Uses the runtime's timer via [`Spawner::sleep`](crate::Spawner::sleep), so
+    /// it works on any runtime.
     pub fn deadline(mut self, dur: Duration) -> Self {
         self.deadline = Some(dur);
         self
@@ -158,5 +167,29 @@ impl<S: Spawner> PoolBuilder<S> {
     /// Builds the pool.
     pub fn build(self) -> Pool<S> {
         Pool::from_builder(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_size_capacity() {
+        assert_eq!(QueueSize::Unbounded.capacity(), usize::MAX);
+        assert_eq!(QueueSize::Bounded(16).capacity(), 16);
+        assert_eq!(QueueSize::Bounded(0).capacity(), 0);
+    }
+
+    #[test]
+    fn queue_size_from_usize_is_bounded() {
+        assert_eq!(QueueSize::from(5), QueueSize::Bounded(5));
+        let qs: QueueSize = 12usize.into();
+        assert_eq!(qs, QueueSize::Bounded(12));
+    }
+
+    #[test]
+    fn queue_size_default_is_unbounded() {
+        assert_eq!(QueueSize::default(), QueueSize::Unbounded);
     }
 }

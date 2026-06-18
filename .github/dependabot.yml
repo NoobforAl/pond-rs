@@ -7,3 +7,10 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
+
+  # Enable version updates for Cargo dependencies (lib + dev-deps).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10

@@ -6,64 +6,82 @@ rust-version = "1.75"
 description = "An idiomatic, runtime-agnostic async + blocking worker pool for Rust."
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/NoobforAl/pond-rs"
+homepage = "https://github.com/NoobforAl/pond-rs"
+documentation = "https://docs.rs/pond-rs"
 keywords = ["pool", "worker", "concurrency", "async", "tokio"]
 categories = ["concurrency", "asynchronous"]
+exclude = [".github/", "codecov.yml", "deny.toml"]
 
-# The package publishes as `pond-rs`, but the library is imported as `pond`
-# (so consumers write `use pond::...`).
 [lib]
 name = "pond"
 
 [features]
 default = ["runtime-tokio", "blocking"]
-# Async pool runtime adapters.
 runtime-tokio = ["dep:tokio"]
-# Synchronous, std::thread-based blocking pool.
+runtime-smol = ["dep:async-global-executor"]
+runtime-async-std = ["dep:async-std"]
 blocking = ["dep:crossbeam-channel"]
-# Debug/monitoring: emit `tracing` spans and events so you can observe task
-# timing and pool behavior in tests and during debugging. Leave this OFF in
-# production — with the feature disabled every instrumentation site compiles
-# away to nothing (zero runtime cost).
+metrics-export = []
 tracing = ["dep:tracing"]
-# Live async task monitoring via tokio-console. Implies `tracing` and enables
-# Tokio's task instrumentation. NOTE: requires building with
-# `RUSTFLAGS="--cfg tokio_unstable"`.
 tokio-console = ["tracing", "dep:console-subscriber", "tokio?/tracing"]
 
 [dependencies]
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+futures = { version = "0.3", default-features = false, features = [
+    "std",
+    "async-await",
+] }
 async-channel = "2"
 event-listener = "5"
 pin-project-lite = "0.2"
 
-tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "time",
+], optional = true }
+async-global-executor = { version = "3", optional = true }
+async-std = { version = "1", optional = true }
 crossbeam-channel = { version = "0.5", optional = true }
-tracing = { version = "0.1", default-features = false, features = ["std", "attributes"], optional = true }
+tracing = { version = "0.1", default-features = false, features = [
+    "std",
+    "attributes",
+], optional = true }
 console-subscriber = { version = "0.5.0", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "fs", "test-util"] }
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "sync",
+    "fs",
+    "net",
+    "io-util",
+    "test-util",
+] }
 futures = { version = "0.3", features = ["executor"] }
 criterion = "0.8.2"
+proptest = "1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-# SQLite for the database-workload integration tests (`tests/sqlite.rs`). The
-# `bundled` feature compiles SQLite from source so no system library is needed.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+[[example]]
+name = "metrics_export"
+required-features = ["metrics-export"]
+
+[[example]]
+name = "smol_runtime"
+required-features = ["runtime-smol"]
 
 [[bench]]
 name = "pool_bench"
 harness = false
 
-# Workload-shaped benchmarks (CPU-bound, concurrency scaling, I/O-like yielding,
-# multi-producer contention).
 [[bench]]
 name = "workload_bench"
 harness = false
 
-# Optimized profiles for this crate's own benches/examples/tests. Downstream
-# consumers control their own profiles; see README.md for guidance.
-# NOTE: deliberately NOT `panic = "abort"` — pool panic-recovery relies on
-# unwinding (`catch_unwind`), which `abort` would silently break.
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -72,17 +90,14 @@ codegen-units = 1
 lto = "thin"
 codegen-units = 1
 
-# `tokio-console` is excluded here because it requires `--cfg tokio_unstable`.
 [package.metadata.docs.rs]
-features = ["runtime-tokio", "blocking", "tracing"]
+features = ["runtime-tokio", "blocking", "tracing", "metrics-export"]
 rustdoc-args = ["--cfg", "docsrs"]
 
-# Centralized lint configuration (the project's linter settings).
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
 unreachable_pub = "warn"
-# `tokio_unstable` is a cfg set externally (via RUSTFLAGS) for the tokio-console feature.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [lints.clippy]

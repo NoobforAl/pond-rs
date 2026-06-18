@@ -19,6 +19,17 @@ use crate::runtime::Spawner;
 /// A cloneable handle to a one-shot cancellation signal.
 ///
 /// Cloning shares the same signal: cancelling any clone cancels them all.
+///
+/// ```
+/// use pond::CancelToken;
+///
+/// let token = CancelToken::new();
+/// assert!(!token.is_cancelled());
+///
+/// let clone = token.clone();
+/// token.cancel();
+/// assert!(clone.is_cancelled()); // clones observe the same cancellation
+/// ```
 #[derive(Clone)]
 pub struct CancelToken {
     inner: Arc<Inner>,
@@ -111,17 +122,17 @@ impl CancelToken {
 
     /// Cancels this token after `dur` elapses (a deadline).
     ///
-    /// Requires the `runtime-tokio` feature (uses Tokio's timer). The watcher is
-    /// spawned on `spawner`.
-    #[cfg(feature = "runtime-tokio")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "runtime-tokio")))]
+    /// Uses the runtime's timer via [`Spawner::sleep`]; the watcher is spawned on
+    /// `spawner`. Works on any runtime — Tokio uses its native timer, others fall
+    /// back to a blocking sleep offloaded via `spawn_blocking`.
     pub fn cancel_after<S>(&self, spawner: &S, dur: std::time::Duration)
     where
         S: Spawner,
     {
         let token = self.clone();
+        let sleep = spawner.sleep(dur);
         spawner.spawn(Box::pin(async move {
-            tokio::time::sleep(dur).await;
+            sleep.await;
             token.cancel();
         }));
     }

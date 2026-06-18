@@ -132,12 +132,9 @@ impl<S: Spawner> Pool<S> {
         if let Some(fut) = cancel_when {
             inner.cancel.cancel_on(&inner.spawner, fut);
         }
-        #[cfg(feature = "runtime-tokio")]
         if let Some(dur) = deadline {
             inner.cancel.cancel_after(&inner.spawner, dur);
         }
-        #[cfg(not(feature = "runtime-tokio"))]
-        let _ = deadline;
 
         Pool { inner }
     }
@@ -165,6 +162,10 @@ impl<S: Spawner> Pool<S> {
 
         if self.inner.non_blocking && self.inner.metrics.waiting() as usize >= self.inner.capacity {
             self.inner.metrics.inc_dropped();
+            warn_event!(
+                capacity = self.inner.capacity,
+                "pond.submit dropped task: queue full"
+            );
             return TaskHandle::resolved(Err(Error::QueueFull));
         }
 
@@ -227,6 +228,12 @@ impl<S: Spawner> Pool<S> {
     /// permits and metrics. Used internally for watchers (e.g. subpools).
     pub(crate) fn spawn_detached(&self, fut: BoxFuture<'static, ()>) {
         self.inner.spawner.spawn(fut);
+    }
+
+    /// The runtime's sleep future for `dur`. Used by the scheduling helpers in
+    /// `schedule.rs` (a sibling module that can't reach the private spawner).
+    pub(crate) fn sleep(&self, dur: std::time::Duration) -> BoxFuture<'static, ()> {
+        self.inner.spawner.sleep(dur)
     }
 
     /// Submits a task, rejecting immediately if the pool is stopped or its
@@ -318,7 +325,17 @@ impl<S: Spawner> Pool<S> {
             // ordering: `Relaxed` — this flag only gates the fast path; the permit
             // handoff itself is synchronized by the channel.
             let _permit = if inner.limited.load(Ordering::Relaxed) {
-                match inner.permit_rx.recv().await {
+                // The `pond.task.wait_permit` child span's duration is exactly the
+                // time this task spent queued behind the concurrency limit — the
+                // most direct signal for explaining tail latency. Compiled out
+                // without `tracing`.
+                let recv = inner.permit_rx.recv();
+                #[cfg(feature = "tracing")]
+                let recv = tracing::Instrument::instrument(
+                    recv,
+                    tracing::debug_span!(target: "pond", "pond.task.wait_permit"),
+                );
+                match recv.await {
                     Ok(()) => Some(PermitGuard {
                         tx: inner.permit_tx.clone(),
                     }),
@@ -341,6 +358,13 @@ impl<S: Spawner> Pool<S> {
             }
 
             inner.metrics.inc_running();
+            // Decrement the running tally and signal idle on the way out via a
+            // guard, so this still runs if a non-recovered task panics and
+            // unwinds. Without it, `running` would leak and `stop_and_wait` (which
+            // waits for the pool to go idle) could hang forever.
+            let _running = RunningGuard {
+                inner: inner.clone(),
+            };
 
             if inner.panic_recovery {
                 match AssertUnwindSafe(task()).catch_unwind().await {
@@ -355,15 +379,13 @@ impl<S: Spawner> Pool<S> {
                     }
                 }
             } else {
-                // No recovery: a panic here propagates on the worker task. The
-                // handle's sender is dropped, so an awaiter observes `Canceled`.
+                // No recovery: a panic here propagates on the worker task and the
+                // handle's sender drops, so an awaiter observes `Canceled`. The
+                // `RunningGuard` above still runs its cleanup during unwinding.
                 let value = task().await;
                 inner.metrics.inc_successful();
                 let _ = tx.send(Ok(value));
             }
-
-            inner.metrics.dec_running();
-            inner.maybe_notify_idle();
         };
 
         // The `pond.task` span's duration is the task's wall-clock time, including
@@ -403,6 +425,10 @@ impl<S: Spawner> Pool<S> {
 
     /// Cancels the pool: queued tasks are abandoned (resolving with
     /// [`Error::Canceled`]) while running tasks are allowed to finish.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(target = "pond", name = "pond.cancel", level = "debug", skip_all)
+    )]
     pub fn cancel(&self) {
         self.inner.cancel.cancel();
     }
@@ -623,6 +649,20 @@ struct PermitGuard {
 impl Drop for PermitGuard {
     fn drop(&mut self) {
         let _ = self.tx.try_send(());
+    }
+}
+
+/// Decrements the running-task tally and signals idle on drop — including during
+/// unwinding, so a non-recovered task panic can't leave `running` permanently
+/// elevated (which would wedge [`Pool::stop_and_wait`]).
+struct RunningGuard<S: Spawner> {
+    inner: Arc<Inner<S>>,
+}
+
+impl<S: Spawner> Drop for RunningGuard<S> {
+    fn drop(&mut self) {
+        self.inner.metrics.dec_running();
+        self.inner.maybe_notify_idle();
     }
 }
 

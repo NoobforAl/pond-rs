@@ -163,6 +163,94 @@ pub struct MetricsSnapshot {
     pub canceled: u64,
 }
 
+#[cfg(feature = "metrics-export")]
+#[cfg_attr(docsrs, doc(cfg(feature = "metrics-export")))]
+impl MetricsSnapshot {
+    /// Renders this snapshot in [Prometheus text exposition format].
+    ///
+    /// `pool_name` is attached as a `pool` label on every metric. Cumulative
+    /// tallies are emitted as `counter`s (with the conventional `_total` suffix)
+    /// and live values as `gauge`s. The result is a ready-to-serve scrape body,
+    /// produced with `std::fmt` only — no extra dependency.
+    ///
+    /// [Prometheus text exposition format]: https://prometheus.io/docs/instrumenting/exposition_formats/
+    ///
+    /// ```
+    /// use pond::MetricsSnapshot;
+    ///
+    /// let text = MetricsSnapshot::default().to_prometheus_text("default");
+    /// assert!(text.contains("pond_tasks_submitted_total{pool=\"default\"} 0"));
+    /// assert!(text.contains("# TYPE pond_running_workers gauge"));
+    /// ```
+    pub fn to_prometheus_text(&self, pool_name: &str) -> String {
+        use std::fmt::Write as _;
+
+        // Escape the label value per the exposition format (backslash, quote, LF).
+        let label = pool_name
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+
+        let mut out = String::new();
+        let mut metric = |name: &str, kind: &str, help: &str, value: u64| {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} {kind}");
+            let _ = writeln!(out, "{name}{{pool=\"{label}\"}} {value}");
+        };
+
+        metric(
+            "pond_tasks_submitted_total",
+            "counter",
+            "Total tasks ever submitted (including dropped ones).",
+            self.submitted,
+        );
+        metric(
+            "pond_tasks_successful_total",
+            "counter",
+            "Tasks that completed successfully.",
+            self.successful,
+        );
+        metric(
+            "pond_tasks_failed_total",
+            "counter",
+            "Tasks that completed with an error or panic.",
+            self.failed,
+        );
+        metric(
+            "pond_tasks_completed_total",
+            "counter",
+            "Completed tasks (successful + failed).",
+            self.completed,
+        );
+        metric(
+            "pond_tasks_dropped_total",
+            "counter",
+            "Tasks dropped because the queue was full.",
+            self.dropped,
+        );
+        metric(
+            "pond_tasks_canceled_total",
+            "counter",
+            "Tasks canceled before execution.",
+            self.canceled,
+        );
+        metric(
+            "pond_running_workers",
+            "gauge",
+            "Workers currently executing or awaiting a task.",
+            self.running_workers,
+        );
+        metric(
+            "pond_waiting_tasks",
+            "gauge",
+            "Tasks currently queued but not yet running.",
+            self.waiting,
+        );
+
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +286,29 @@ mod tests {
         assert_eq!(m2.snapshot().submitted, 1);
     }
 
+    #[cfg(feature = "metrics-export")]
+    #[test]
+    fn prometheus_text_renders_counters_and_gauges() {
+        let m = Metrics::new();
+        m.inc_submitted();
+        m.inc_successful();
+        m.inc_running();
+        let text = m.snapshot().to_prometheus_text("api");
+
+        assert!(text.contains("# TYPE pond_tasks_submitted_total counter"));
+        assert!(text.contains("pond_tasks_submitted_total{pool=\"api\"} 1"));
+        assert!(text.contains("pond_tasks_successful_total{pool=\"api\"} 1"));
+        assert!(text.contains("# TYPE pond_running_workers gauge"));
+        assert!(text.contains("pond_running_workers{pool=\"api\"} 1"));
+    }
+
+    #[cfg(feature = "metrics-export")]
+    #[test]
+    fn prometheus_label_is_escaped() {
+        let text = MetricsSnapshot::default().to_prometheus_text("a\"b\\c");
+        assert!(text.contains("pool=\"a\\\"b\\\\c\""));
+    }
+
     #[test]
     fn dec_counters() {
         let m = Metrics::new();
@@ -209,5 +320,50 @@ mod tests {
         let snap = m.snapshot();
         assert_eq!(snap.running_workers, 1);
         assert_eq!(snap.waiting, 0);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Each counter must reflect exactly its own `inc`/`dec` calls — no
+        /// cross-contamination between fields — and `completed` must always equal
+        /// `successful + failed`.
+        #[test]
+        fn snapshot_reflects_operations(
+            submitted in 0u64..50,
+            successful in 0u64..50,
+            failed in 0u64..50,
+            dropped in 0u64..50,
+            canceled in 0u64..50,
+            running_inc in 0u64..50,
+            running_dec in 0u64..50,
+            waiting_inc in 0u64..50,
+            waiting_dec in 0u64..50,
+        ) {
+            // Never decrement below zero (the counters are unsigned).
+            let running_dec = running_dec.min(running_inc);
+            let waiting_dec = waiting_dec.min(waiting_inc);
+
+            let m = Metrics::new();
+            for _ in 0..submitted { m.inc_submitted(); }
+            for _ in 0..successful { m.inc_successful(); }
+            for _ in 0..failed { m.inc_failed(); }
+            for _ in 0..dropped { m.inc_dropped(); }
+            for _ in 0..canceled { m.inc_canceled(); }
+            for _ in 0..running_inc { m.inc_running(); }
+            for _ in 0..running_dec { m.dec_running(); }
+            for _ in 0..waiting_inc { m.inc_waiting(); }
+            for _ in 0..waiting_dec { m.dec_waiting(); }
+
+            let snap = m.snapshot();
+            prop_assert_eq!(snap.submitted, submitted);
+            prop_assert_eq!(snap.successful, successful);
+            prop_assert_eq!(snap.failed, failed);
+            prop_assert_eq!(snap.dropped, dropped);
+            prop_assert_eq!(snap.canceled, canceled);
+            prop_assert_eq!(snap.running_workers, running_inc - running_dec);
+            prop_assert_eq!(snap.waiting, waiting_inc - waiting_dec);
+            prop_assert_eq!(snap.completed, snap.successful + snap.failed);
+        }
     }
 }

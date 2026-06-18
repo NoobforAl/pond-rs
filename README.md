@@ -11,8 +11,9 @@ An idiomatic, runtime-agnostic worker pool for Rust.
 
 - **Async pool** that runs futures with bounded concurrency on a pluggable runtime.
 - **Blocking pool** that runs synchronous closures on OS threads (no async runtime needed).
-- **Pluggable runtime** via the `Spawner` trait — Tokio supported out of the box behind the
-  default `runtime-tokio` feature; other runtimes (async-std, smol, …) can be added later.
+- **Pluggable runtime** via the `Spawner` trait — choose your async runtime with a Cargo
+  feature: `runtime-tokio` (default), `runtime-smol`, or `runtime-async-std`. Any other runtime
+  works by implementing `Spawner` yourself.
 - Task **handles** (awaitable futures), **task groups**, **subpools**, dynamic **resize**,
   graceful **shutdown**, **cancellation**, and rich **metrics**.
 - **Context integration**: bridge any external cancellation source or deadline into the pool, and
@@ -83,12 +84,30 @@ let _ = handle.wait();
 
 ## Cargo features
 
-| Feature         | Default | Description                                                        |
-| --------------- | ------- | ----------------------------------------------------------------- |
-| `runtime-tokio` | yes     | Tokio adapter (`TokioSpawner`).                                   |
-| `blocking`      | yes     | Synchronous, thread-based `blocking::Pool`.                       |
-| `tracing`       | no      | Debug/monitoring: emit `tracing` spans + events (zero cost when off). |
-| `tokio-console` | no      | Live async task monitoring via tokio-console (needs `tokio_unstable`). |
+| Feature             | Default | Description                                                        |
+| ------------------- | ------- | ----------------------------------------------------------------- |
+| `runtime-tokio`     | yes     | Tokio adapter (`TokioSpawner`).                                   |
+| `runtime-smol`      | no      | smol adapter (`SmolSpawner`), backed by `async-global-executor`. |
+| `runtime-async-std` | no      | `async-std` adapter (`AsyncStdSpawner`).                         |
+| `blocking`          | yes     | Synchronous, thread-based `blocking::Pool`.                       |
+| `tracing`           | no      | Debug/monitoring: emit `tracing` spans + events (zero cost when off). |
+| `tokio-console`     | no      | Live async task monitoring via tokio-console (needs `tokio_unstable`). |
+| `metrics-export`    | no      | `MetricsSnapshot::to_prometheus_text` (Prometheus exposition; no extra deps). |
+
+Pick a non-default runtime with `--no-default-features` plus the runtime you want, then build the
+pool with `Pool::builder_with`:
+
+```rust
+use pond::{Pool, SmolSpawner};
+
+let pool = Pool::builder_with(SmolSpawner::new()).max_concurrency(4).build();
+let result = futures::executor::block_on(async { pool.submit(|| async { 1 + 2 }).await.unwrap() });
+assert_eq!(result, 3);
+```
+
+> **Embassy is intentionally not supported.** Its executor uses statically allocated, compile-time
+> fixed task pools (no dynamic/boxed-future spawning) and no `spawn_blocking`, which is incompatible
+> with this pool's runtime-agnostic `Spawner` model. It targets `no_std` embedded; pond is `std`.
 
 ## Monitoring & debugging
 

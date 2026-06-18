@@ -27,6 +27,22 @@ use crate::runtime::Spawner;
 use crate::submit::TaskSink;
 
 /// A concurrency-limited child of a [`Pool`].
+///
+/// A subpool runs on its parent's workers but caps how many it may use at once,
+/// so one workload can't starve the rest. Create one with
+/// [`Pool::subpool`](crate::Pool::subpool).
+///
+/// ```
+/// # #[tokio::main]
+/// # async fn main() {
+/// use pond::Pool;
+///
+/// let pool = Pool::builder().max_concurrency(100).build();
+/// let subpool = pool.subpool(10); // at most 10 of the 100 workers
+/// let handle = subpool.submit(|| async { 6 * 7 });
+/// assert_eq!(handle.await.unwrap(), 42);
+/// # }
+/// ```
 pub struct Subpool<S: Spawner> {
     inner: Arc<SubInner<S>>,
 }
@@ -126,6 +142,14 @@ impl<S: Spawner> Subpool<S> {
 
     /// Submits a task to the subpool. Never blocks; a stopped subpool or a full
     /// bounded queue (when non-blocking) resolves the handle with an [`Error`].
+    ///
+    /// # Panics
+    ///
+    /// A panicking task is **always** caught and surfaced as
+    /// [`Error::Panicked`] on the returned handle, independent of the parent
+    /// pool's [`panic_recovery`](crate::PoolBuilder::panic_recovery) setting. A
+    /// subpool is an isolation boundary, so one task's panic never aborts the
+    /// shared parent workers.
     pub fn submit<F, Fut, T>(&self, task: F) -> TaskHandle<T>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -138,6 +162,10 @@ impl<S: Spawner> Subpool<S> {
         }
         if self.inner.non_blocking && self.inner.metrics.waiting() as usize >= self.inner.capacity {
             self.inner.metrics.inc_dropped();
+            warn_event!(
+                capacity = self.inner.capacity,
+                "pond.subpool.submit dropped task: queue full"
+            );
             return TaskHandle::resolved(Err(Error::QueueFull));
         }
         self.spawn_task(task)
@@ -224,7 +252,15 @@ impl<S: Spawner> Subpool<S> {
         // cancellation, panic capture and metrics.
         self.inner.parent.spawn(move || async move {
             let _permit = if run.limited.load(Ordering::Relaxed) {
-                match run.permit_rx.recv().await {
+                // Child span: time spent queued behind the subpool's concurrency
+                // cap. Compiled out without `tracing`.
+                let recv = run.permit_rx.recv();
+                #[cfg(feature = "tracing")]
+                let recv = tracing::Instrument::instrument(
+                    recv,
+                    tracing::debug_span!(target: "pond", "pond.task.wait_permit"),
+                );
+                match recv.await {
                     Ok(()) => Some(SubPermit { inner: run.clone() }),
                     Err(_) => None, // channel closed (cancelled): proceed to dispose
                 }

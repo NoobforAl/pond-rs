@@ -7,15 +7,25 @@ use std::time::Duration;
 use pond::{Error, Pool, QueueSize};
 use tokio::time::sleep;
 
-/// Helper: poll until `cond` is true or a timeout elapses.
-async fn wait_until(mut cond: impl FnMut() -> bool) {
-    for _ in 0..1000 {
-        if cond() {
-            return;
-        }
-        sleep(Duration::from_millis(2)).await;
-    }
-    panic!("condition not met within timeout");
+mod common;
+use common::wait_until;
+
+#[tokio::test]
+async fn stop_and_wait_does_not_hang_after_unrecovered_panic() {
+    // Regression: a non-recovered task panic must still resolve its handle (as
+    // `Canceled`) and must not leak the running tally — otherwise `stop_and_wait`
+    // (which waits for the pool to go idle) would hang forever.
+    let pool = Pool::builder()
+        .max_concurrency(2)
+        .panic_recovery(false)
+        .build();
+    let handle = pool.submit(|| async { panic!("boom") });
+    assert!(matches!(handle.await, Err(Error::Canceled)));
+
+    tokio::time::timeout(Duration::from_secs(5), pool.stop_and_wait())
+        .await
+        .expect("stop_and_wait hung after a non-recovered panic");
+    assert_eq!(pool.running_workers(), 0);
 }
 
 #[tokio::test]

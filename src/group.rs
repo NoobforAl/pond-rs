@@ -144,7 +144,29 @@ impl<P: TaskSink, T: Send + 'static> ResultTaskGroup<P, T> {
 
 /// A group of fallible tasks that short-circuits on the first error.
 ///
-/// Create one with [`Pool::try_group`].
+/// Create one with [`Pool::try_group`]. [`wait`](TryTaskGroup::wait) returns the
+/// collected `Ok` values in submission order, or the first error (which cancels
+/// the remaining queued tasks).
+///
+/// ```
+/// # #[tokio::main]
+/// # async fn main() {
+/// use pond::{GroupError, Pool};
+///
+/// let pool = Pool::builder().max_concurrency(4).build();
+/// let mut group = pool.try_group::<i32, String>();
+/// for i in 0..5 {
+///     group.submit(move || async move {
+///         if i == 3 { Err(format!("task {i} failed")) } else { Ok(i) }
+///     });
+/// }
+/// match group.wait().await {
+///     Ok(values) => unreachable!("task 3 fails: {values:?}"),
+///     Err(GroupError::Task(e)) => assert_eq!(e, "task 3 failed"),
+///     Err(GroupError::Pool(e)) => panic!("unexpected pool error: {e}"),
+/// }
+/// # }
+/// ```
 pub struct TryTaskGroup<P: TaskSink, T, E> {
     pool: P,
     token: CancelToken,

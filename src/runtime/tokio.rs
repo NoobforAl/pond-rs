@@ -41,6 +41,15 @@ impl Spawner for TokioSpawner {
     fn spawn_blocking(&self, f: Box<dyn FnOnce() + Send + 'static>) {
         self.handle.spawn_blocking(f);
     }
+
+    fn sleep(&self, dur: std::time::Duration) -> BoxFuture<'static, ()> {
+        // Lazy: the `Sleep` is constructed on first poll, which happens inside
+        // the runtime context (the future is spawned via `handle.spawn`), so no
+        // explicit `Handle::enter` is needed.
+        Box::pin(async move {
+            tokio::time::sleep(dur).await;
+        })
+    }
 }
 
 #[cfg(test)]

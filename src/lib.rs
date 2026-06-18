@@ -32,6 +32,33 @@
 //! pool.stop_and_wait().await;
 //! # }
 //! ```
+//!
+//! ## Architecture
+//!
+//! A few internal design notes for contributors and the curious:
+//!
+//! * **Concurrency is a permit channel, not a counter.** A bounded pool fills an
+//!   unbounded channel with `max_concurrency` `()` permits; each task must
+//!   receive one before running and returns it (via an RAII guard) when done.
+//!   This makes "wait for a free slot" a plain channel `recv().await` — no
+//!   condition variables — and makes [`resize`](Pool::resize) just add or drain
+//!   permits. The `pond.task.wait_permit` span (with the `tracing` feature) times
+//!   exactly this wait.
+//! * **Subpools layer a second gate.** A [`Subpool`] runs on its parent's workers
+//!   but holds its own permit channel, so a task must acquire *both* a subpool
+//!   permit and a parent permit. That is how a subpool caps its share of the
+//!   parent without a separate thread pool.
+//! * **One submission path, abstracted by `TaskSink`.** [`Pool`] and [`Subpool`]
+//!   both implement [`TaskSink`], so task groups ([`ResultTaskGroup`],
+//!   [`TryTaskGroup`]) are generic over where they submit.
+//! * **Cancellation is an `event-listener` broadcast.** [`CancelToken`] flips an
+//!   atomic and wakes all waiters; the pool spawns one watcher task that reacts
+//!   by closing the permit channels and notifying idle/slot listeners.
+//! * **Metrics are independent atomic counters** ([`MetricsSnapshot`]). Because no
+//!   counter publishes other memory, `Relaxed` ordering is correct and cheapest.
+//!
+//! The async [`Pool`] never assumes Tokio: every runtime touchpoint goes through
+//! the [`Spawner`] trait, so the same logic runs on Tokio, smol, or async-std.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -60,15 +87,23 @@ pub use crate::runtime::Spawner;
 #[cfg(feature = "runtime-tokio")]
 pub use crate::runtime::TokioSpawner;
 
+#[cfg(feature = "runtime-smol")]
+pub use crate::runtime::SmolSpawner;
+
+#[cfg(feature = "runtime-async-std")]
+pub use crate::runtime::AsyncStdSpawner;
+
 // Async pool surface.
 mod group;
 mod options;
 mod pool;
+mod schedule;
 mod submit;
 mod subpool;
 pub use crate::group::{GroupBuilder, GroupError, ResultTaskGroup, TryGroupBuilder, TryTaskGroup};
 pub use crate::options::{PoolBuilder, QueueSize};
 pub use crate::pool::{Pool, StopHandle, TaskHandle};
+pub use crate::schedule::{Job, RetryPolicy, ScheduledTask};
 pub use crate::submit::TaskSink;
 pub use crate::subpool::{Subpool, SubpoolBuilder};
 
@@ -76,7 +111,10 @@ pub use crate::subpool::{Subpool, SubpoolBuilder};
 #[cfg(feature = "runtime-tokio")]
 mod default;
 #[cfg(feature = "runtime-tokio")]
-pub use crate::default::{default_pool, group, submit, subpool, try_group};
+pub use crate::default::{
+    default_pool, group, schedule_every, submit, submit_after, submit_at, submit_n,
+    submit_with_retry, subpool, try_group,
+};
 
 // Synchronous, thread-based pool.
 #[cfg(feature = "blocking")]

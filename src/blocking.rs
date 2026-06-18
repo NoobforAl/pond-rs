@@ -104,6 +104,21 @@ impl PoolBuilder {
 
     /// How long a non-core (dynamically spawned) idle thread waits for work
     /// before retiring. Only relevant when `min_concurrency < max_concurrency`.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pond::blocking::Pool;
+    ///
+    /// // 2 always-alive threads, growing to 8 under load; extra threads retire
+    /// // after 5s idle.
+    /// let pool = Pool::builder()
+    ///     .min_concurrency(2)
+    ///     .max_concurrency(8)
+    ///     .keep_alive(Duration::from_secs(5))
+    ///     .build();
+    /// assert_eq!(pool.min_concurrency(), 2);
+    /// pool.stop_and_wait();
+    /// ```
     pub fn keep_alive(mut self, dur: Duration) -> Self {
         self.keep_alive = dur;
         self
@@ -442,5 +457,61 @@ impl<T> BlockingTaskHandle<T> {
     /// Blocks until the task completes and returns its result.
     pub fn wait(self) -> Result<T> {
         self.rx.recv().unwrap_or(Err(Error::Canceled))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submit_and_wait_returns_value() {
+        let pool = Pool::builder().max_concurrency(2).build();
+        assert_eq!(pool.submit(|| 1 + 2).wait().unwrap(), 3);
+        assert_eq!(pool.submitted_tasks(), 1);
+        pool.stop_and_wait();
+    }
+
+    #[test]
+    fn builder_reflects_core_and_max() {
+        let pool = Pool::builder()
+            .min_concurrency(2)
+            .max_concurrency(8)
+            .build();
+        assert_eq!(pool.min_concurrency(), 2);
+        assert_eq!(pool.max_concurrency(), 8);
+        // Core threads are spawned eagerly.
+        assert_eq!(pool.live_workers(), 2);
+        pool.stop_and_wait();
+    }
+
+    #[test]
+    fn panicking_task_is_recovered_as_error() {
+        let pool = Pool::builder().max_concurrency(1).build();
+        let err = pool.submit(|| panic!("boom")).wait().unwrap_err();
+        assert!(matches!(err, Error::Panicked(_)));
+        // The pool survives the panic and keeps serving tasks.
+        assert_eq!(pool.submit(|| 7).wait().unwrap(), 7);
+        pool.stop_and_wait();
+    }
+
+    #[test]
+    fn stop_and_wait_is_idempotent() {
+        let pool = Pool::builder().max_concurrency(2).build();
+        pool.submit(|| ()).wait().unwrap();
+        pool.stop_and_wait();
+        pool.stop_and_wait(); // second call must not hang or panic
+        assert!(pool.is_stopped());
+    }
+
+    #[test]
+    fn submit_after_cancel_is_rejected() {
+        let pool = Pool::builder().max_concurrency(2).build();
+        pool.cancel();
+        assert!(pool.is_stopped());
+        // try_submit reports the rejection explicitly.
+        assert!(pool.try_submit(|| 1).is_err());
+        // submit resolves to an error rather than running the task.
+        assert!(pool.submit(|| 1).wait().is_err());
     }
 }

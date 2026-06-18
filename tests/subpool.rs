@@ -4,8 +4,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pond::Pool;
+use pond::{Error, Pool};
 use tokio::time::sleep;
+
+#[tokio::test]
+async fn subpool_always_recovers_panics_even_when_parent_disables_recovery() {
+    // The parent disables panic recovery, but a subpool is an isolation boundary
+    // and recovers regardless — the panic surfaces as `Error::Panicked` and the
+    // subpool keeps serving tasks.
+    let parent = Pool::builder()
+        .max_concurrency(4)
+        .panic_recovery(false)
+        .build();
+    let sub = parent.subpool(2);
+
+    let err = sub.submit(|| async { panic!("boom") }).await.unwrap_err();
+    assert!(matches!(err, Error::Panicked(_)), "got {err:?}");
+
+    // Subpool still works after the panic.
+    assert_eq!(sub.submit(|| async { 7 }).await.unwrap(), 7);
+}
 
 #[tokio::test]
 async fn subpool_limits_its_own_concurrency() {
