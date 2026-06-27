@@ -7,6 +7,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Builder config for streaming & monitoring: a `ResultSink<T>` channel interface
+  (impl'd for `async_channel::Sender`, extensible to any channel via a newtype);
+  `Pool::results_to` → a typed `ResultPool` that streams each result to a sink;
+  `GroupBuilder`/`TryGroupBuilder::result_channel` → a `StreamGroup` that streams
+  results as they finish; and `PoolBuilder::metrics_channel` / `pool_name` (plus a
+  bulk `PoolConfig` via `.config(..)`) to push periodic `MetricsSnapshot`s to a
+  channel. All runtime-agnostic; a `config_channels` example demonstrates them.
 - Task scheduling & management on `Pool` (and the default-pool free functions):
   delayed (`submit_after`, `submit_at`), recurring (`schedule_every` → cancellable
   `ScheduledTask`), retry-on-failure (`submit_with_retry` + `RetryPolicy`), and

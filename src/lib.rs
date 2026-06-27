@@ -97,13 +97,19 @@ pub use crate::runtime::AsyncStdSpawner;
 mod group;
 mod options;
 mod pool;
+mod result_pool;
 mod schedule;
+mod sink;
 mod submit;
 mod subpool;
-pub use crate::group::{GroupBuilder, GroupError, ResultTaskGroup, TryGroupBuilder, TryTaskGroup};
-pub use crate::options::{PoolBuilder, QueueSize};
+pub use crate::group::{
+    GroupBuilder, GroupError, ResultTaskGroup, StreamGroup, TryGroupBuilder, TryTaskGroup,
+};
+pub use crate::options::{MetricsConfig, PoolBuilder, PoolConfig, QueueSize};
 pub use crate::pool::{Pool, StopHandle, TaskHandle};
+pub use crate::result_pool::ResultPool;
 pub use crate::schedule::{Job, RetryPolicy, ScheduledTask};
+pub use crate::sink::ResultSink;
 pub use crate::submit::TaskSink;
 pub use crate::subpool::{Subpool, SubpoolBuilder};
 

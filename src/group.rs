@@ -10,12 +10,14 @@
 
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::cancel::CancelToken;
 use crate::context::TaskContext;
 use crate::error::Error;
 use crate::pool::{Pool, TaskHandle};
 use crate::runtime::Spawner;
+use crate::sink::ResultSink;
 use crate::submit::TaskSink;
 use crate::subpool::Subpool;
 
@@ -318,6 +320,18 @@ impl<S: Spawner, T: Send + 'static> GroupBuilder<S, T> {
         let token = self.cancel_token.unwrap_or_default();
         ResultTaskGroup::new_with_token(sub, token)
     }
+
+    /// Builds a streaming group: instead of collecting results to await with
+    /// `wait()`, each task's `T` is pushed to `sink` as it completes. Use this
+    /// when you'd rather receive results on a channel than hold a `Vec`.
+    pub fn result_channel<K>(self, sink: K) -> StreamGroup<S, T>
+    where
+        K: ResultSink<T>,
+    {
+        let token = self.cancel_token.unwrap_or_default();
+        let sub = Subpool::from_parts(self.parent, self.max_concurrency, usize::MAX, false, token);
+        StreamGroup::new(sub, Arc::new(sink))
+    }
 }
 
 /// Builder for a [`TryTaskGroup`] with a concurrency cap and/or an external
@@ -362,5 +376,59 @@ impl<S: Spawner, T: Send + 'static, E: Send + 'static> TryGroupBuilder<S, T, E> 
         );
         let token = self.cancel_token.unwrap_or_default();
         TryTaskGroup::new_with_token(sub, token)
+    }
+
+    /// Builds a streaming group that pushes each task's `Result<T, E>` to `sink`
+    /// as it completes (both successes and errors flow through the channel).
+    pub fn result_channel<K>(self, sink: K) -> StreamGroup<S, std::result::Result<T, E>>
+    where
+        K: ResultSink<std::result::Result<T, E>>,
+    {
+        let token = self.cancel_token.unwrap_or_default();
+        let sub = Subpool::from_parts(self.parent, self.max_concurrency, usize::MAX, false, token);
+        StreamGroup::new(sub, Arc::new(sink))
+    }
+}
+
+/// A streaming task group created by
+/// [`GroupBuilder::result_channel`] / [`TryGroupBuilder::result_channel`].
+///
+/// Tasks run on a concurrency-capped subpool and each result is pushed to the
+/// configured [`ResultSink`] as it finishes; [`wait`](StreamGroup::wait) just
+/// awaits completion (the results are already on your channel).
+pub struct StreamGroup<S: Spawner, V> {
+    sub: Subpool<S>,
+    sink: Arc<dyn ResultSink<V>>,
+}
+
+impl<S: Spawner, V: Send + 'static> StreamGroup<S, V> {
+    fn new(sub: Subpool<S>, sink: Arc<dyn ResultSink<V>>) -> Self {
+        Self { sub, sink }
+    }
+
+    /// Submits a task; its output is streamed to the sink on completion.
+    pub fn submit<F, Fut>(&self, task: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = V> + Send + 'static,
+    {
+        let sink = self.sink.clone();
+        // Fire-and-forget: the result goes to the sink, not a handle.
+        self.sub.spawn(move || async move {
+            let value = task().await;
+            sink.send(value);
+        });
+    }
+
+    /// Awaits completion of all submitted tasks. Results were delivered to the
+    /// sink as they finished. After this the group accepts no more tasks.
+    pub async fn wait(self) -> crate::error::Result<()> {
+        self.sub.stop_and_wait().await;
+        Ok(())
+    }
+
+    /// Cancels the group: queued tasks are abandoned, running ones finish.
+    pub fn cancel(&self) {
+        self.sub.cancel();
     }
 }

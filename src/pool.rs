@@ -62,6 +62,7 @@ struct Inner<S: Spawner> {
     idle: Event, // notified when the pool becomes fully idle
     slot: Event, // notified when a queue slot frees up
     task_data: Option<Arc<dyn Any + Send + Sync>>,
+    name: Option<String>,
 }
 
 #[cfg(feature = "runtime-tokio")]
@@ -86,6 +87,8 @@ impl<S: Spawner> Pool<S> {
         let cancel_when = b.cancel_when.take();
         let deadline = b.deadline.take();
         let task_data = b.task_data.take();
+        let name = b.pool_name.take();
+        let metrics_cfg = b.metrics.take();
         let limited = b.max_concurrency != 0;
         // An unbounded token channel: `send` never blocks, so releasing a permit
         // is always immediate.
@@ -112,6 +115,7 @@ impl<S: Spawner> Pool<S> {
             idle: Event::new(),
             slot: Event::new(),
             task_data,
+            name,
         });
 
         // Watch the cancel token: when it fires, stop accepting tasks and wake
@@ -136,7 +140,28 @@ impl<S: Spawner> Pool<S> {
             inner.cancel.cancel_after(&inner.spawner, dur);
         }
 
+        // Periodic metrics export: push a snapshot to the sink every interval
+        // until the pool stops. Runtime-agnostic (uses `Spawner::sleep`).
+        if let Some(cfg) = metrics_cfg {
+            let watch = inner.clone();
+            inner.spawner.spawn(Box::pin(async move {
+                loop {
+                    watch.spawner.sleep(cfg.interval).await;
+                    if watch.closed.load(Ordering::Relaxed) || watch.cancel.is_cancelled() {
+                        break;
+                    }
+                    cfg.sink.send(watch.metrics.snapshot());
+                }
+            }));
+        }
+
         Pool { inner }
+    }
+
+    /// The pool's configured name, if any (set via
+    /// [`PoolBuilder::pool_name`](crate::PoolBuilder::pool_name)).
+    pub fn name(&self) -> Option<&str> {
+        self.inner.name.as_deref()
     }
 
     /// Submits a task, returning a [`TaskHandle`] that resolves with its result.

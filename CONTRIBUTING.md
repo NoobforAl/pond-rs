@@ -9,12 +9,23 @@ A `Makefile` wraps the common cargo commands (it deliberately avoids
 `--all-features`, because `tokio-console` needs a special `RUSTFLAGS`):
 
 ```bash
-make test        # cargo test --features runtime-tokio,blocking,tracing
+make test        # tests on the safe feature set
+make test-all    # tests + doctests on ALL features (every runtime + monitoring)
 make clippy      # clippy with warnings denied
 make fmt-check   # formatting check
 make doc         # build the API docs
-make all         # fmt-check + clippy + test (run this before pushing)
+make all         # fmt-check + clippy + test-all (run this before pushing)
 make console     # type-check the tokio-console feature (sets tokio_unstable)
+```
+
+Reports & profiling (saved to files, opened in your browser):
+
+```bash
+make bench         # run Criterion benchmarks
+make report        # open the Criterion HTML report (target/criterion/report/)
+make coverage      # HTML coverage report (needs: cargo install cargo-llvm-cov)
+make flamegraph    # CPU flamegraph of the benches (needs: cargo install flamegraph)
+make metrics-dump  # write Prometheus monitoring output to target/metrics.prom
 ```
 
 ## Feature flags

@@ -8,8 +8,52 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 
 use crate::cancel::CancelToken;
+use crate::metrics::MetricsSnapshot;
 use crate::pool::Pool;
 use crate::runtime::Spawner;
+use crate::sink::ResultSink;
+
+/// Periodic metrics-export configuration (see [`PoolBuilder::metrics_channel`]).
+///
+/// Every `interval`, the pool pushes a [`MetricsSnapshot`] to the sink until it
+/// stops. Render Prometheus text from the snapshot with
+/// [`to_prometheus_text`](MetricsSnapshot::to_prometheus_text) (the
+/// `metrics-export` feature).
+#[derive(Clone)]
+pub struct MetricsConfig {
+    pub(crate) interval: Duration,
+    pub(crate) sink: Arc<dyn ResultSink<MetricsSnapshot>>,
+}
+
+impl MetricsConfig {
+    /// Pushes a snapshot to `sink` every `interval`.
+    pub fn new<K: ResultSink<MetricsSnapshot>>(interval: Duration, sink: K) -> Self {
+        Self {
+            interval,
+            sink: Arc::new(sink),
+        }
+    }
+}
+
+impl std::fmt::Debug for MetricsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsConfig")
+            .field("interval", &self.interval)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Bulk pool configuration applied via [`PoolBuilder::config`].
+///
+/// Equivalent to setting the corresponding individual builder methods; fields
+/// left `None` are ignored.
+#[derive(Clone, Default)]
+pub struct PoolConfig {
+    /// Name used as the Prometheus `pool` label, also via [`Pool::name`](crate::Pool::name).
+    pub pool_name: Option<String>,
+    /// Periodic metrics export to a channel.
+    pub metrics: Option<MetricsConfig>,
+}
 
 /// The capacity of a pool's task queue (tasks accepted but not yet running).
 ///
@@ -61,6 +105,8 @@ pub struct PoolBuilder<S: Spawner> {
     pub(crate) cancel_when: Option<BoxFuture<'static, ()>>,
     pub(crate) deadline: Option<Duration>,
     pub(crate) task_data: Option<Arc<dyn Any + Send + Sync>>,
+    pub(crate) pool_name: Option<String>,
+    pub(crate) metrics: Option<MetricsConfig>,
 }
 
 impl<S: Spawner> PoolBuilder<S> {
@@ -76,7 +122,40 @@ impl<S: Spawner> PoolBuilder<S> {
             cancel_when: None,
             deadline: None,
             task_data: None,
+            pool_name: None,
+            metrics: None,
         }
+    }
+
+    /// Applies a [`PoolConfig`] in bulk (a name and/or periodic metrics export).
+    ///
+    /// Equivalent to calling [`pool_name`](Self::pool_name) /
+    /// [`metrics_channel`](Self::metrics_channel) for each set field.
+    pub fn config(mut self, cfg: PoolConfig) -> Self {
+        if let Some(name) = cfg.pool_name {
+            self.pool_name = Some(name);
+        }
+        if let Some(metrics) = cfg.metrics {
+            self.metrics = Some(metrics);
+        }
+        self
+    }
+
+    /// Sets the pool's name (used as the Prometheus `pool` label and returned by
+    /// [`Pool::name`](crate::Pool::name)).
+    pub fn pool_name(mut self, name: impl Into<String>) -> Self {
+        self.pool_name = Some(name.into());
+        self
+    }
+
+    /// Pushes a [`MetricsSnapshot`] to `sink` every `interval` until the pool
+    /// stops. `sink` is any [`ResultSink`] (e.g. an `async_channel::Sender`).
+    pub fn metrics_channel<K>(mut self, interval: Duration, sink: K) -> Self
+    where
+        K: ResultSink<MetricsSnapshot>,
+    {
+        self.metrics = Some(MetricsConfig::new(interval, sink));
+        self
     }
 
     /// Sets the maximum number of tasks that may run concurrently.
