@@ -15,15 +15,31 @@ pub(crate) struct Metrics {
     inner: Arc<MetricsInner>,
 }
 
+/// A cache-line-aligned `AtomicU64`, so independently-contended counters don't
+/// share a line and cause false sharing under high concurrency (many submitters
+/// bumping submit-side counters while workers bump completion-side ones). `Deref`
+/// keeps every call site reading/writing it exactly like a plain atomic.
+#[repr(align(64))]
+#[derive(Default)]
+struct Padded(AtomicU64);
+
+impl std::ops::Deref for Padded {
+    type Target = AtomicU64;
+    #[inline]
+    fn deref(&self) -> &AtomicU64 {
+        &self.0
+    }
+}
+
 #[derive(Default)]
 struct MetricsInner {
-    running_workers: AtomicU64,
-    submitted: AtomicU64,
-    waiting: AtomicU64,
-    successful: AtomicU64,
-    failed: AtomicU64,
-    dropped: AtomicU64,
-    canceled: AtomicU64,
+    running_workers: Padded,
+    submitted: Padded,
+    waiting: Padded,
+    successful: Padded,
+    failed: Padded,
+    dropped: Padded,
+    canceled: Padded,
 }
 
 impl Metrics {
@@ -52,6 +68,33 @@ impl Metrics {
     #[inline]
     pub(crate) fn inc_waiting(&self) {
         self.inner.waiting.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically reserves a queue slot iff fewer than `capacity` tasks are
+    /// currently waiting, incrementing `waiting` on success.
+    ///
+    /// This closes the check-then-increment race in the submit paths: concurrent
+    /// callers can no longer all observe `waiting < capacity` and then each push,
+    /// overshooting a bounded queue. Returns `false` (without incrementing) when
+    /// the queue is already full.
+    #[inline]
+    pub(crate) fn try_reserve_waiting(&self, capacity: usize) -> bool {
+        let cap = capacity as u64;
+        let mut cur = self.inner.waiting.load(Ordering::Relaxed);
+        loop {
+            if cur >= cap {
+                return false;
+            }
+            match self.inner.waiting.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     #[inline]
@@ -145,7 +188,8 @@ impl Metrics {
 /// are also exposed directly on the pool (e.g. `running_workers()`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MetricsSnapshot {
-    /// Number of workers currently executing or waiting for a task.
+    /// Number of tasks currently executing (have acquired a concurrency permit
+    /// and are running). Queued-but-not-started tasks are counted by `waiting`.
     pub running_workers: u64,
     /// Total number of tasks ever submitted (including dropped ones).
     pub submitted: u64,
@@ -237,7 +281,7 @@ impl MetricsSnapshot {
         metric(
             "pond_running_workers",
             "gauge",
-            "Workers currently executing or awaiting a task.",
+            "Tasks currently executing (holding a concurrency permit).",
             self.running_workers,
         );
         metric(

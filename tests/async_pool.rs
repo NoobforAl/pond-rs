@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+#![cfg(feature = "runtime-tokio")]
 //! Integration tests for the async [`Pool`].
 
 use std::sync::atomic::{AtomicUsize, Ordering};

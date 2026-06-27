@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+#![cfg(feature = "runtime-tokio")]
 //! Integration tests for subpools.
 
 use std::sync::atomic::{AtomicUsize, Ordering};

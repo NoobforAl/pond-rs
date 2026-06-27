@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+#![cfg(feature = "runtime-tokio")]
 //! Tests for builder config: result-channel streaming and periodic metrics.
 
 use std::time::Duration;

@@ -16,10 +16,11 @@
 //! pool.stop_and_wait();
 //! ```
 
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
@@ -145,10 +146,19 @@ pub struct Pool {
 struct Inner {
     sender: Sender<Msg>,
     receiver: Receiver<Msg>,
-    workers: Mutex<Vec<JoinHandle<()>>>,
+    // Live worker threads keyed by `ThreadId`. A worker removes its own entry as
+    // it exits (keep-alive retire *or* shutdown), so retired non-core threads no
+    // longer accumulate dead `JoinHandle`s for the pool's lifetime.
+    workers: Mutex<HashMap<ThreadId, JoinHandle<()>>>,
     core_size: usize,
     max_size: usize,
     capacity: usize,
+    // Queue-slot semaphore for a *bounded* pool: pre-filled with `capacity`
+    // tokens. A submitter takes a token (blocking, or `try` when non-blocking)
+    // before enqueuing; a worker returns it when it dequeues the job. This bounds
+    // the queue depth — true backpressure — while keeping the `Msg` channel
+    // unbounded so shutdown signalling can never block. `None` when unbounded.
+    queue_slots: Option<(Sender<()>, Receiver<()>)>,
     non_blocking: bool,
     panic_recovery: bool,
     keep_alive: Duration,
@@ -189,14 +199,29 @@ impl Pool {
 
         let (sender, receiver) = crossbeam_channel::unbounded::<Msg>();
 
+        let capacity = b.queue_size.capacity();
+        // Build the queue-slot semaphore only for a genuinely bounded queue
+        // (1..usize::MAX). A capacity of 0 is handled inline (rendezvous / always
+        // reject) and unbounded needs no slots.
+        let queue_slots = if capacity == 0 || capacity == usize::MAX {
+            None
+        } else {
+            let (tx, rx) = crossbeam_channel::bounded::<()>(capacity);
+            for _ in 0..capacity {
+                let _ = tx.try_send(());
+            }
+            Some((tx, rx))
+        };
+
         let pool = Pool {
             inner: Arc::new(Inner {
                 sender,
                 receiver,
-                workers: Mutex::new(Vec::with_capacity(max_size)),
+                workers: Mutex::new(HashMap::with_capacity(max_size)),
                 core_size,
                 max_size,
-                capacity: b.queue_size.capacity(),
+                capacity,
+                queue_slots,
                 non_blocking: b.non_blocking,
                 panic_recovery: b.panic_recovery,
                 keep_alive: b.keep_alive,
@@ -218,8 +243,12 @@ impl Pool {
     fn spawn_worker(&self, core: bool) {
         self.inner.live.fetch_add(1, Ordering::Relaxed);
         let inner = self.inner.clone();
+        // Register the handle under the `workers` lock *before* releasing it, so a
+        // worker that exits immediately can't race ahead of its own registration
+        // (its self-removal also takes this lock, so it waits for the insert).
+        let mut workers = self.inner.workers.lock().unwrap();
         let handle = std::thread::spawn(move || worker_loop(inner, core));
-        self.inner.workers.lock().unwrap().push(handle);
+        workers.insert(handle.thread().id(), handle);
     }
 
     /// Grows the pool by one non-core thread if all threads are busy and we are
@@ -233,7 +262,30 @@ impl Pool {
         }
     }
 
+    /// Acquires a queue slot for a bounded pool. When `block` is set, waits for a
+    /// free slot (true backpressure); otherwise returns `false` immediately if the
+    /// queue is full. Always succeeds for an unbounded pool.
+    fn acquire_slot(&self, block: bool) -> bool {
+        match &self.inner.queue_slots {
+            Some((_, rx)) => {
+                if block {
+                    rx.recv().is_ok()
+                } else {
+                    rx.try_recv().is_ok()
+                }
+            }
+            // No semaphore: unbounded admits always; a zero-capacity queue admits
+            // only in blocking mode (a rendezvous-style direct handoff).
+            None => self.inner.capacity != 0 || block,
+        }
+    }
+
     /// Submits a task. Returns a handle to await its result.
+    ///
+    /// For a **bounded** pool (a `queue_size`), the default (blocking) submit
+    /// applies backpressure: it waits for a free queue slot when the queue is
+    /// full, rather than growing it without limit. A `non_blocking` pool instead
+    /// drops the task with [`Error::QueueFull`]. An unbounded pool never blocks.
     pub fn submit<F, T>(&self, task: F) -> BlockingTaskHandle<T>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -244,19 +296,22 @@ impl Pool {
         if self.is_stopped() {
             return BlockingTaskHandle::resolved(Err(self.stop_error()));
         }
-        if self.inner.non_blocking && self.inner.metrics.waiting() as usize >= self.inner.capacity {
+        // Grow first so a fresh worker can relieve a full bounded queue before a
+        // blocking submit parks on `acquire_slot`.
+        self.maybe_grow();
+        if !self.acquire_slot(!self.inner.non_blocking) {
             self.inner.metrics.inc_dropped();
             return BlockingTaskHandle::resolved(Err(Error::QueueFull));
         }
 
         let (rx, job) = self.make_job(task);
+        self.inner.metrics.inc_waiting();
         let _ = self.inner.sender.send(Msg::Run(job));
-        self.maybe_grow();
         BlockingTaskHandle { rx }
     }
 
     /// Submits a task, returning an error immediately if the pool is stopped or
-    /// its bounded queue is full.
+    /// its bounded queue is full (never blocks, regardless of `non_blocking`).
     pub fn try_submit<F, T>(&self, task: F) -> Result<BlockingTaskHandle<T>>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -267,14 +322,15 @@ impl Pool {
         if self.is_stopped() {
             return Err(self.stop_error());
         }
-        if self.inner.metrics.waiting() as usize >= self.inner.capacity {
+        self.maybe_grow();
+        if !self.acquire_slot(false) {
             self.inner.metrics.inc_dropped();
             return Err(Error::QueueFull);
         }
 
         let (rx, job) = self.make_job(task);
+        self.inner.metrics.inc_waiting();
         let _ = self.inner.sender.send(Msg::Run(job));
-        self.maybe_grow();
         Ok(BlockingTaskHandle { rx })
     }
 
@@ -285,12 +341,17 @@ impl Pool {
     {
         let (tx, rx) = crossbeam_channel::bounded::<Result<T>>(1);
         let metrics = self.inner.metrics.clone();
-        metrics.inc_waiting();
         let recovery = self.inner.panic_recovery;
         let cancel = self.inner.cancel.clone();
+        // Returned to the queue-slot semaphore once the job is dequeued, so a
+        // blocked submitter can proceed (bounded pools only).
+        let slot_tx = self.inner.queue_slots.as_ref().map(|(tx, _)| tx.clone());
 
         let job: Job = Box::new(move || {
             metrics.dec_waiting();
+            if let Some(slot_tx) = &slot_tx {
+                let _ = slot_tx.try_send(());
+            }
             // A task cancelled before it runs is disposed without executing.
             if cancel.is_cancelled() {
                 metrics.inc_canceled();
@@ -355,8 +416,14 @@ impl Pool {
     }
 
     fn join_workers(&self) {
-        let mut workers = self.inner.workers.lock().unwrap();
-        for handle in workers.drain(..) {
+        // Drain the handles and release the lock *before* joining: a worker
+        // removes its own entry as it exits, which needs this same lock, so
+        // holding it across `join` would deadlock.
+        let handles: Vec<JoinHandle<()>> = {
+            let mut workers = self.inner.workers.lock().unwrap();
+            workers.drain().map(|(_, h)| h).collect()
+        };
+        for handle in handles {
             let _ = handle.join();
         }
     }
@@ -430,16 +497,21 @@ fn worker_loop(inner: Arc<Inner>, core: bool) {
 
         match msg {
             Ok(Msg::Run(job)) => job(),
-            Ok(Msg::Shutdown) => break,
-            Err(RecvTimeoutError::Timeout) => {
-                // A non-core thread that has been idle too long retires.
-                inner.live.fetch_sub(1, Ordering::Relaxed);
-                return;
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
+            // A non-core thread idle past keep-alive retires, same as any other
+            // exit: drop out of the loop and reap self below.
+            Ok(Msg::Shutdown)
+            | Err(RecvTimeoutError::Timeout)
+            | Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     inner.live.fetch_sub(1, Ordering::Relaxed);
+    // Reap our own handle so retired threads don't accumulate. A no-op if
+    // `join_workers` already drained the map during shutdown.
+    inner
+        .workers
+        .lock()
+        .unwrap()
+        .remove(&std::thread::current().id());
 }
 
 /// A handle to a task submitted to a blocking [`Pool`].
@@ -502,6 +574,107 @@ mod tests {
         pool.stop_and_wait();
         pool.stop_and_wait(); // second call must not hang or panic
         assert!(pool.is_stopped());
+    }
+
+    #[test]
+    fn retired_threads_are_reaped() {
+        let pool = Pool::builder()
+            .min_concurrency(1)
+            .max_concurrency(4)
+            .keep_alive(Duration::from_millis(50))
+            .build();
+
+        // Drive several bursts; each grows the pool with non-core threads that
+        // must retire and be reaped (not leak a JoinHandle) afterwards.
+        for _ in 0..3 {
+            let handles: Vec<_> = (0..4)
+                .map(|_| pool.submit(|| std::thread::sleep(Duration::from_millis(40))))
+                .collect();
+            for h in handles {
+                h.wait().unwrap();
+            }
+            // Wait past keep_alive so the extra (non-core) threads retire.
+            std::thread::sleep(Duration::from_millis(250));
+
+            let tracked = pool.inner.workers.lock().unwrap().len();
+            // The tracked-handle count must collapse back toward the core size and
+            // never exceed the live thread count — proving handles are reaped.
+            assert!(
+                tracked <= pool.live_workers() + 1,
+                "leaked JoinHandles: tracked={tracked}, live={}",
+                pool.live_workers()
+            );
+            assert!(tracked <= 4, "tracked handles grew past max: {tracked}");
+        }
+
+        pool.stop_and_wait();
+        assert_eq!(pool.inner.workers.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn bounded_blocking_submit_applies_backpressure() {
+        use std::sync::mpsc;
+
+        let pool = Pool::builder().max_concurrency(1).queue_size(1).build();
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+        let started = Arc::new(AtomicBool::new(false));
+        let s = started.clone();
+        // Occupy the only worker until released.
+        let _gate = pool.submit(move || {
+            s.store(true, Ordering::SeqCst);
+            let _ = release_rx.recv();
+        });
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // Fill the single queue slot.
+        let _queued = pool.submit(|| {});
+
+        // The next submit must block: worker busy, queue full.
+        let pool2 = pool.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let _ = pool2.submit(|| {});
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "submit should block on a full bounded queue"
+        );
+
+        // Releasing the worker clears backpressure and the blocked submit proceeds.
+        let _ = release_tx.send(());
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "blocked submit should proceed once a slot frees"
+        );
+        h.join().unwrap();
+        pool.stop_and_wait();
+    }
+
+    #[test]
+    fn bounded_non_blocking_drops_when_full() {
+        let pool = Pool::builder()
+            .max_concurrency(1)
+            .queue_size(1)
+            .non_blocking(true)
+            .build();
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+        let started = Arc::new(AtomicBool::new(false));
+        let s = started.clone();
+        let _gate = pool.submit(move || {
+            s.store(true, Ordering::SeqCst);
+            let _ = release_rx.recv();
+        });
+        while !started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // One fits in the queue; the next is dropped rather than blocking.
+        pool.try_submit(|| {}).expect("first queued task fits");
+        assert!(matches!(pool.try_submit(|| {}), Err(Error::QueueFull)));
+        assert!(matches!(pool.submit(|| {}).wait(), Err(Error::QueueFull)));
+        let _ = release_tx.send(());
+        pool.stop_and_wait();
     }
 
     #[test]

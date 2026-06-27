@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+#![cfg(feature = "runtime-tokio")]
 //! Integration tests for the task-scheduling helpers.
 //!
 //! Timing tests use Tokio's virtual clock (`start_paused`), so they're
@@ -100,6 +102,57 @@ async fn submit_with_retry_exhausts_and_returns_last_error() {
         attempts.load(Ordering::SeqCst),
         3,
         "should try exactly max_attempts"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn submit_with_retry_if_stops_on_non_retryable() {
+    let pool = Pool::builder().max_concurrency(2).build();
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let a = attempts.clone();
+    let policy = RetryPolicy::new(5).backoff(Duration::from_millis(10));
+    // Only retry "transient" errors; a "permanent" error returns immediately.
+    let handle = pool.submit_with_retry_if(
+        policy,
+        move || {
+            let a = a.clone();
+            async move {
+                a.fetch_add(1, Ordering::SeqCst);
+                Err::<u32, &str>("permanent")
+            }
+        },
+        |e| *e == "transient",
+    );
+
+    assert_eq!(handle.await.unwrap(), Err("permanent"));
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "non-retryable error must not be retried"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn submit_with_retry_caps_backoff() {
+    // With an aggressive exponential and a tight cap, the total wait stays
+    // bounded by max_attempts * max_backoff (plus jitter headroom).
+    let pool = Pool::builder().max_concurrency(2).build();
+    let policy = RetryPolicy::new(4)
+        .backoff(Duration::from_secs(1))
+        .exponential(true)
+        .max_backoff(Duration::from_secs(2))
+        .jitter(true);
+
+    let start = tokio::time::Instant::now();
+    let handle = pool.submit_with_retry(policy, || async { Err::<u32, &str>("nope") });
+    assert_eq!(handle.await.unwrap(), Err("nope"));
+    // Uncapped this would be 1 + 2 + 4 = 7s of backoff; capped at 2s it is at
+    // most 2 + 2 + 2 = 6s, and with equal jitter strictly less.
+    assert!(
+        start.elapsed() < Duration::from_secs(7),
+        "max_backoff did not cap the delay: {:?}",
+        start.elapsed()
     );
 }
 

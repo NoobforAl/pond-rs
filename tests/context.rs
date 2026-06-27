@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+#![cfg(feature = "runtime-tokio")]
 //! Tests for per-task `TaskContext` (cancellation awareness + shared data).
 
 use std::any::Any;

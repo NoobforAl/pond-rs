@@ -116,6 +116,48 @@ fn async_group(c: &mut Criterion) {
     group.finish();
 }
 
+/// Many producers hammering one shared pool concurrently. This is the scenario
+/// where metric-counter contention (submit-side vs completion-side atomics) would
+/// show up, so it doubles as the regression bench for the counter layout.
+fn async_many_producers(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    const PRODUCERS: u64 = 8;
+    const PER_PRODUCER: u64 = 2_000;
+
+    let mut group = c.benchmark_group("async_many_producers");
+    group.throughput(Throughput::Elements(PRODUCERS * PER_PRODUCER));
+    group.bench_function("8x2000", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let pool = Pool::builder().max_concurrency(8).build();
+                let producers: Vec<_> = (0..PRODUCERS)
+                    .map(|_| {
+                        let pool = pool.clone();
+                        tokio::spawn(async move {
+                            let handles: Vec<_> = (0..PER_PRODUCER)
+                                .map(|i| pool.submit(move || async move { black_box(i) }))
+                                .collect();
+                            for h in handles {
+                                h.await.unwrap();
+                            }
+                        })
+                    })
+                    .collect();
+                for p in producers {
+                    p.await.unwrap();
+                }
+                pool.stop_and_wait().await;
+            });
+        });
+    });
+    group.finish();
+}
+
 /// Submit N trivial tasks to the blocking pool and wait for all of them.
 #[cfg(feature = "blocking")]
 fn blocking_submit(c: &mut Criterion) {
@@ -145,6 +187,7 @@ criterion_group!(
     tokio_spawn_baseline,
     async_submit_one_latency,
     async_group,
+    async_many_producers,
     blocking_submit
 );
 #[cfg(not(feature = "blocking"))]
@@ -153,6 +196,7 @@ criterion_group!(
     async_submit,
     tokio_spawn_baseline,
     async_submit_one_latency,
-    async_group
+    async_group,
+    async_many_producers
 );
 criterion_main!(benches);

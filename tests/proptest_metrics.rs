@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+#![cfg(feature = "runtime-tokio")]
 //! Property test for the pool's metric accounting at quiescence.
 //!
 //! For any task count and failure pattern, once the pool has drained every

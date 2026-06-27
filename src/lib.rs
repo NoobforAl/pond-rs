@@ -53,7 +53,10 @@
 //!   [`TryTaskGroup`]) are generic over where they submit.
 //! * **Cancellation is an `event-listener` broadcast.** [`CancelToken`] flips an
 //!   atomic and wakes all waiters; the pool spawns one watcher task that reacts
-//!   by closing the permit channels and notifying idle/slot listeners.
+//!   by closing the permit channels and notifying idle/slot listeners. That
+//!   watcher (and the optional metrics-export task) holds only a `Weak` reference
+//!   to the pool's shared state, so **dropping the last [`Pool`] handle frees it
+//!   and stops those background tasks** even if you never call `stop`/`cancel`.
 //! * **Metrics are independent atomic counters** ([`MetricsSnapshot`]). Because no
 //!   counter publishes other memory, `Relaxed` ordering is correct and cheapest.
 //!
@@ -95,6 +98,7 @@ pub use crate::runtime::AsyncStdSpawner;
 
 // Async pool surface.
 mod group;
+mod join;
 mod options;
 mod pool;
 mod result_pool;
@@ -105,6 +109,7 @@ mod subpool;
 pub use crate::group::{
     GroupBuilder, GroupError, ResultTaskGroup, StreamGroup, TryGroupBuilder, TryTaskGroup,
 };
+pub use crate::join::join_all;
 pub use crate::options::{MetricsConfig, PoolBuilder, PoolConfig, QueueSize};
 pub use crate::pool::{Pool, StopHandle, TaskHandle};
 pub use crate::result_pool::ResultPool;

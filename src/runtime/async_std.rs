@@ -31,6 +31,14 @@ impl Spawner for AsyncStdSpawner {
     fn spawn_blocking(&self, f: Box<dyn FnOnce() + Send + 'static>) {
         async_std::task::spawn_blocking(f);
     }
+
+    fn sleep(&self, dur: std::time::Duration) -> BoxFuture<'static, ()> {
+        // Native async timer instead of the default thread-per-sleep, so
+        // scheduled/deadline work scales without spawning OS threads.
+        Box::pin(async move {
+            async_std::task::sleep(dur).await;
+        })
+    }
 }
 
 #[cfg(test)]

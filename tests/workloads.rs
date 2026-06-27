@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+#![cfg(feature = "runtime-tokio")]
 //! Realistic workload scenario tests.
 //!
 //! Where `async_pool.rs` checks individual behaviors, this suite exercises the

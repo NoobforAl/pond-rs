@@ -33,6 +33,15 @@ impl Spawner for SmolSpawner {
     fn spawn_blocking(&self, f: Box<dyn FnOnce() + Send + 'static>) {
         async_global_executor::spawn_blocking(f).detach();
     }
+
+    fn sleep(&self, dur: std::time::Duration) -> BoxFuture<'static, ()> {
+        // Use the reactor's timer rather than the default `spawn_blocking` sleep,
+        // so scheduled work (delays, recurring ticks, retry backoff, deadlines)
+        // doesn't burn an OS thread per sleep.
+        Box::pin(async move {
+            async_io::Timer::after(dur).await;
+        })
+    }
 }
 
 #[cfg(test)]

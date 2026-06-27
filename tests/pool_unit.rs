@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+#![cfg(feature = "runtime-tokio")]
 //! Runtime-free unit tests for `Pool` logic, driven by the [`MockSpawner`] test
 //! double instead of Tokio. These assert the synchronous bookkeeping that runs
 //! on the submit/stop/resize paths — no task scheduling races involved.

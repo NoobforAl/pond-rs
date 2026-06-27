@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use event_listener::Event;
 use futures::channel::oneshot;
+use futures::future::{select, Either};
 use futures::FutureExt;
 
 use crate::cancel::CancelToken;
@@ -61,13 +62,21 @@ struct SubInner<S: Spawner> {
     permit_rx: async_channel::Receiver<()>,
     limited: AtomicBool,
     max_concurrency: AtomicUsize,
+    // Serializes `resize` so concurrent calls don't interleave permit changes.
+    resize_lock: std::sync::Mutex<()>,
     capacity: usize, // queued-task cap (usize::MAX == unbounded)
     non_blocking: bool,
     metrics: Metrics,
+    // Tasks admitted but not yet terminal; idle detection keys off this single
+    // counter to avoid the dequeue/start race (see `Pool`'s `outstanding`).
+    outstanding: AtomicUsize,
     closed: AtomicBool,
     cancel: CancelToken,
     idle: Event,
     slot: Event,
+    // Notified when the last `Subpool` handle drops, so the cancellation watcher
+    // (which holds a `Weak<SubInner>`) wakes and terminates. See `Drop`.
+    shutdown: Arc<Event>,
 }
 
 impl<S: Spawner> Subpool<S> {
@@ -116,25 +125,39 @@ impl<S: Spawner> Subpool<S> {
             permit_rx,
             limited: AtomicBool::new(limited),
             max_concurrency: AtomicUsize::new(effective),
+            resize_lock: std::sync::Mutex::new(()),
             capacity,
             non_blocking,
             metrics: Metrics::new(),
+            outstanding: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             cancel,
             idle: Event::new(),
             slot: Event::new(),
+            shutdown: Arc::new(Event::new()),
         });
 
         // Watch cancellation: close the permit channel and wake waiters so
         // cancelled tasks observe it (works for `cancel()` and external tokens).
-        let watch = inner.clone();
+        //
+        // Holds a `Weak<SubInner>` and races a `shutdown` signal (fired by
+        // `Drop`) so it never keeps the subpool alive and exits promptly when the
+        // last handle drops instead of parking on `cancelled()` forever.
+        let weak = Arc::downgrade(&inner);
+        let cancel = inner.cancel.clone();
+        let shutdown = inner.shutdown.clone();
         inner.parent.spawn_detached(Box::pin(async move {
-            watch.cancel.cancelled().await;
-            watch.closed.store(true, Ordering::Relaxed);
-            watch.permit_rx.close();
-            watch.permit_tx.close();
-            watch.slot.notify(usize::MAX);
-            watch.idle.notify(usize::MAX);
+            let cancelled = Box::pin(cancel.cancelled());
+            if let Either::Right(_) = select(cancelled, shutdown.listen()).await {
+                return; // subpool dropped: `SubInner` is gone, nothing to do
+            }
+            if let Some(inner) = weak.upgrade() {
+                inner.closed.store(true, Ordering::Relaxed);
+                inner.permit_rx.close();
+                inner.permit_tx.close();
+                inner.slot.notify(usize::MAX);
+                inner.idle.notify(usize::MAX);
+            }
         }));
 
         Subpool { inner }
@@ -160,13 +183,17 @@ impl<S: Spawner> Subpool<S> {
         if self.is_stopped() {
             return TaskHandle::resolved(Err(self.stop_error()));
         }
-        if self.inner.non_blocking && self.inner.metrics.waiting() as usize >= self.inner.capacity {
-            self.inner.metrics.inc_dropped();
-            warn_event!(
-                capacity = self.inner.capacity,
-                "pond.subpool.submit dropped task: queue full"
-            );
-            return TaskHandle::resolved(Err(Error::QueueFull));
+        if self.inner.non_blocking {
+            if !self.inner.try_admit() {
+                self.inner.metrics.inc_dropped();
+                warn_event!(
+                    capacity = self.inner.capacity,
+                    "pond.subpool.submit dropped task: queue full"
+                );
+                return TaskHandle::resolved(Err(Error::QueueFull));
+            }
+        } else {
+            self.inner.admit();
         }
         self.spawn_task(task)
     }
@@ -183,7 +210,7 @@ impl<S: Spawner> Subpool<S> {
         if self.is_stopped() {
             return Err(self.stop_error());
         }
-        if self.inner.metrics.waiting() as usize >= self.inner.capacity {
+        if !self.inner.try_admit() {
             self.inner.metrics.inc_dropped();
             return Err(Error::QueueFull);
         }
@@ -203,12 +230,15 @@ impl<S: Spawner> Subpool<S> {
             if self.is_stopped() {
                 return TaskHandle::resolved(Err(self.stop_error()));
             }
-            if (self.inner.metrics.waiting() as usize) < self.inner.capacity {
+            if self.inner.try_admit() {
                 break;
             }
             let listener = self.inner.slot.listen();
-            if (self.inner.metrics.waiting() as usize) < self.inner.capacity || self.is_stopped() {
-                continue;
+            if self.inner.try_admit() {
+                break;
+            }
+            if self.is_stopped() {
+                return TaskHandle::resolved(Err(self.stop_error()));
             }
             listener.await;
         }
@@ -243,7 +273,8 @@ impl<S: Spawner> Subpool<S> {
         Fut: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        self.inner.metrics.inc_waiting();
+        // Queued + outstanding counters were already bumped by the caller's
+        // admission step (`admit`/`try_admit`).
         let (tx, rx) = oneshot::channel();
         let run = self.inner.clone();
 
@@ -274,7 +305,7 @@ impl<S: Spawner> Subpool<S> {
             if run.cancel.is_cancelled() {
                 run.metrics.inc_canceled();
                 let _ = tx.send(Err(run.cancel.cause().unwrap_or(Error::Canceled)));
-                run.maybe_notify_idle();
+                run.dispatch_done();
                 return;
             }
 
@@ -290,7 +321,7 @@ impl<S: Spawner> Subpool<S> {
                 }
             }
             run.metrics.dec_running();
-            run.maybe_notify_idle();
+            run.dispatch_done();
         });
 
         TaskHandle::new(rx)
@@ -349,6 +380,8 @@ impl<S: Spawner> Subpool<S> {
             );
         }
         let inner = &self.inner;
+        // Serialize against other resizes so permit reconciliation is atomic.
+        let _resize = inner.resize_lock.lock().unwrap();
         let old = inner
             .max_concurrency
             .swap(max_concurrency, Ordering::Relaxed);
@@ -449,11 +482,31 @@ impl<S: Spawner> Subpool<S> {
 
 impl<S: Spawner> SubInner<S> {
     fn is_idle(&self) -> bool {
-        self.metrics.running() == 0 && self.metrics.waiting() == 0
+        self.outstanding.load(Ordering::Relaxed) == 0
     }
 
-    fn maybe_notify_idle(&self) {
-        if self.is_idle() {
+    /// Unconditionally admits a task (bumps queued + outstanding counters).
+    #[inline]
+    fn admit(&self) {
+        self.metrics.inc_waiting();
+        self.outstanding.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically admits a task only if the bounded queue has room.
+    #[inline]
+    fn try_admit(&self) -> bool {
+        if self.metrics.try_reserve_waiting(self.capacity) {
+            self.outstanding.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Records a task reaching a terminal state; signals idle if it was the last.
+    #[inline]
+    fn dispatch_done(&self) {
+        if self.outstanding.fetch_sub(1, Ordering::Relaxed) == 1 {
             self.idle.notify(usize::MAX);
         }
     }
@@ -469,6 +522,14 @@ impl<S: Spawner> SubInner<S> {
             }
             listener.await;
         }
+    }
+}
+
+impl<S: Spawner> Drop for SubInner<S> {
+    fn drop(&mut self) {
+        // Wake the cancellation watcher (it holds only a `Weak<SubInner>`) so it
+        // terminates rather than leaking as a parked task on the parent runtime.
+        self.shutdown.notify(usize::MAX);
     }
 }
 
