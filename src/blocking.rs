@@ -2,7 +2,7 @@
 //!
 //! Unlike the async [`Pool`](crate::Pool), this pool runs **blocking** closures
 //! on OS threads and needs no async runtime. It mirrors the same concepts:
-//! bounded concurrency, task handles, metrics, cancellation, task groups and
+//! bounded concurrency, task handles, cancellation, task groups and
 //! graceful shutdown — plus a genuine **core/max thread model** (a minimum number
 //! of always-alive threads and a maximum it grows to on demand, with idle extra
 //! threads retiring after a keep-alive timeout).
@@ -27,7 +27,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::cancel::CancelToken;
 use crate::error::{panic_message, Error, Result};
-use crate::metrics::{Metrics, MetricsSnapshot};
+use crate::metrics::Metrics;
 use crate::options::QueueSize;
 
 mod group;
@@ -307,7 +307,7 @@ impl Pool {
         let (rx, job) = self.make_job(task);
         self.inner.metrics.inc_waiting();
         let _ = self.inner.sender.send(Msg::Run(job));
-        BlockingTaskHandle { rx }
+        BlockingTaskHandle::chan(rx)
     }
 
     /// Submits a task, returning an error immediately if the pool is stopped or
@@ -331,7 +331,7 @@ impl Pool {
         let (rx, job) = self.make_job(task);
         self.inner.metrics.inc_waiting();
         let _ = self.inner.sender.send(Msg::Run(job));
-        Ok(BlockingTaskHandle { rx })
+        Ok(BlockingTaskHandle::chan(rx))
     }
 
     fn make_job<F, T>(&self, task: F) -> (Receiver<Result<T>>, Job)
@@ -455,31 +455,6 @@ impl Pool {
     pub fn live_workers(&self) -> usize {
         self.inner.live.load(Ordering::Relaxed)
     }
-
-    /// A snapshot of all metrics.
-    pub fn metrics(&self) -> MetricsSnapshot {
-        self.inner.metrics.snapshot()
-    }
-
-    /// Number of tasks currently running.
-    pub fn running_workers(&self) -> u64 {
-        self.inner.metrics.running()
-    }
-
-    /// Total number of tasks ever submitted.
-    pub fn submitted_tasks(&self) -> u64 {
-        self.inner.metrics.submitted()
-    }
-
-    /// Number of tasks currently queued.
-    pub fn waiting_tasks(&self) -> u64 {
-        self.inner.metrics.waiting()
-    }
-
-    /// Number of tasks canceled before execution.
-    pub fn canceled_tasks(&self) -> u64 {
-        self.inner.metrics.canceled()
-    }
 }
 
 fn worker_loop(inner: Arc<Inner>, core: bool) {
@@ -516,19 +491,36 @@ fn worker_loop(inner: Arc<Inner>, core: bool) {
 
 /// A handle to a task submitted to a blocking [`Pool`].
 pub struct BlockingTaskHandle<T> {
-    rx: Receiver<Result<T>>,
+    state: HandleState<T>,
+}
+
+enum HandleState<T> {
+    /// Waiting on the worker's result channel.
+    Chan(Receiver<Result<T>>),
+    /// Already resolved at creation (e.g. a rejected submission). Stored
+    /// inline, so a rejected `submit` allocates nothing.
+    Done(Option<Result<T>>),
 }
 
 impl<T> BlockingTaskHandle<T> {
+    fn chan(rx: Receiver<Result<T>>) -> Self {
+        Self {
+            state: HandleState::Chan(rx),
+        }
+    }
+
     fn resolved(result: Result<T>) -> Self {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        let _ = tx.send(result);
-        Self { rx }
+        Self {
+            state: HandleState::Done(Some(result)),
+        }
     }
 
     /// Blocks until the task completes and returns its result.
     pub fn wait(self) -> Result<T> {
-        self.rx.recv().unwrap_or(Err(Error::Canceled))
+        match self.state {
+            HandleState::Done(slot) => slot.unwrap_or(Err(Error::Canceled)),
+            HandleState::Chan(rx) => rx.recv().unwrap_or(Err(Error::Canceled)),
+        }
     }
 }
 
@@ -540,7 +532,8 @@ mod tests {
     fn submit_and_wait_returns_value() {
         let pool = Pool::builder().max_concurrency(2).build();
         assert_eq!(pool.submit(|| 1 + 2).wait().unwrap(), 3);
-        assert_eq!(pool.submitted_tasks(), 1);
+        // The pool survives and keeps serving tasks.
+        assert_eq!(pool.submit(|| 7).wait().unwrap(), 7);
         pool.stop_and_wait();
     }
 

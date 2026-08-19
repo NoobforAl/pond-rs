@@ -18,3 +18,20 @@ Cargo.lock
 # Tracy bin exc
 *.tracy
 tracu
+# Scratch output from the CI dependency-hygiene check
+shipped-tree.txt
+
+# Profiling output (flamegraph writes into the repo root)
+flamegraph.svg
+perf.data
+perf.data.old
+dhat-heap.json
+
+# Coverage output (`make coverage` / cargo-llvm-cov)
+lcov.info
+*.profraw
+*.profdata
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

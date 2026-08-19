@@ -22,7 +22,7 @@ fn main() {
     println!("results = {results:?}");
 
     pool.stop_and_wait();
-    println!("completed {} tasks", pool.metrics().completed);
+    println!("completed {} tasks", results.len());
 }
 
 #[cfg(not(feature = "blocking"))]

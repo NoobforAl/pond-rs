@@ -3,6 +3,7 @@
 //! Tests for per-task `TaskContext` (cancellation awareness + shared data).
 
 use std::any::Any;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,8 +48,11 @@ async fn task_ctx_reads_shared_data_and_streams_results() {
 #[tokio::test]
 async fn task_ctx_breaks_early_on_cancel_midrun() {
     let pool = Pool::builder().max_concurrency(1).build();
+    let started = Arc::new(AtomicBool::new(false));
+    let s = started.clone();
 
-    let h = pool.submit_ctx(|ctx| async move {
+    let h = pool.submit_ctx(move |ctx| async move {
+        s.store(true, Ordering::SeqCst);
         tokio::select! {
             _ = ctx.cancelled() => "cancelled",
             _ = sleep(Duration::from_secs(10)) => "completed",
@@ -56,11 +60,7 @@ async fn task_ctx_breaks_early_on_cancel_midrun() {
     });
 
     // Make sure the task is actually running before we cancel.
-    wait_until({
-        let pool = pool.clone();
-        move || pool.running_workers() == 1
-    })
-    .await;
+    wait_until(|| started.load(Ordering::SeqCst)).await;
 
     pool.cancel();
     assert_eq!(h.await.unwrap(), "cancelled");

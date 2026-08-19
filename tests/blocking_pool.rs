@@ -1,7 +1,7 @@
 //! Integration tests for the synchronous blocking pool.
 #![cfg(feature = "blocking")]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
@@ -96,16 +96,19 @@ fn try_submit_rejects_when_queue_full() {
         .queue_size(QueueSize::Bounded(1))
         .build();
 
-    // Occupy the single worker with a barrier it can't pass yet.
+    // Occupy the single worker with a barrier it can't pass yet; `started`
+    // flips once the task body is running (it has left the queue and holds the
+    // only worker).
     let barrier = Arc::new(Barrier::new(2));
     let b = barrier.clone();
+    let started = Arc::new(AtomicBool::new(false));
+    let s = started.clone();
     let _busy = pool.submit(move || {
+        s.store(true, Ordering::SeqCst);
         b.wait();
     });
+    spin_until(|| started.load(Ordering::SeqCst));
 
-    // Wait until the worker has actually started the busy task, so the next
-    // submit lands in the queue (not the free worker).
-    spin_until(|| pool.metrics().running_workers >= 1);
     let _queued = pool.try_submit(|| {}).expect("queued ok");
 
     // The single queue slot is now full; the next submit must be rejected.
@@ -114,24 +117,6 @@ fn try_submit_rejects_when_queue_full() {
 
     barrier.wait();
     pool.stop_and_wait();
-}
-
-#[test]
-fn metrics_track_completion() {
-    let pool = Pool::new(2);
-    let mut handles = Vec::new();
-    for i in 0..10 {
-        handles.push(pool.submit(move || i));
-    }
-    for h in handles {
-        h.wait().unwrap();
-    }
-    pool.stop_and_wait();
-    let m = pool.metrics();
-    assert_eq!(m.submitted, 10);
-    assert_eq!(m.successful, 10);
-    assert_eq!(m.completed, 10);
-    assert_eq!(m.running_workers, 0);
 }
 
 #[test]
@@ -153,8 +138,10 @@ fn stop_and_wait_drains_queue() {
 fn pool_clone_shares_state() {
     let pool = Pool::new(2);
     let clone = pool.clone();
-    clone.submit(|| {}).wait().unwrap();
-    assert_eq!(pool.submitted_tasks(), 1);
+    // Work submitted through the clone runs on the same pool, so the original
+    // observes its result and keeps serving work.
+    assert_eq!(clone.submit(|| 21).wait().unwrap() * 2, 42);
+    assert_eq!(pool.submit(|| 7).wait().unwrap(), 7);
     pool.stop_and_wait();
 }
 
@@ -199,11 +186,14 @@ fn cancel_abandons_queued_tasks() {
     let pool = Pool::new(1);
     let barrier = Arc::new(Barrier::new(2));
     let b = barrier.clone();
+    let started = Arc::new(AtomicBool::new(false));
+    let s = started.clone();
     let busy = pool.submit(move || {
+        s.store(true, Ordering::SeqCst);
         b.wait();
     });
     // Ensure the single worker is occupied before queuing the tasks we'll cancel.
-    spin_until(|| pool.metrics().running_workers >= 1);
+    spin_until(|| started.load(Ordering::SeqCst));
 
     let queued: Vec<_> = (0..5).map(|i| pool.submit(move || i)).collect();
     pool.cancel();
@@ -213,7 +203,6 @@ fn cancel_abandons_queued_tasks() {
     for h in queued {
         assert_eq!(h.wait(), Err(Error::Canceled));
     }
-    assert!(pool.canceled_tasks() >= 1);
 }
 
 #[test]

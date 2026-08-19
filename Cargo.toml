@@ -22,15 +22,6 @@ runtime-tokio = ["dep:tokio"]
 runtime-smol = ["dep:async-global-executor", "dep:async-io"]
 runtime-async-std = ["dep:async-std"]
 blocking = ["dep:crossbeam-channel"]
-metrics-export = []
-# Heap profiling for the `mem_profile` example (via dhat); off by default.
-dhat-heap = ["dep:dhat"]
-# Live memory + span profiling in the Tracy GUI (for the `tracy_profile` example).
-# Implies `tracing` so pond's spans show up in Tracy. Off by default. The Tracy
-# client is used via `tracing_tracy::client` to avoid a duplicate-version clash.
-tracy = ["tracing", "dep:tracing-tracy"]
-tracing = ["dep:tracing"]
-tokio-console = ["tracing", "dep:console-subscriber", "tokio?/tracing"]
 
 [dependencies]
 futures = { version = "0.3", default-features = false, features = [
@@ -38,7 +29,8 @@ futures = { version = "0.3", default-features = false, features = [
     "async-await",
 ] }
 async-channel = "2"
-event-listener = "5"
+# 5.4.2 fixes RUSTSEC-2026-0221 (`StackSlot` letting `!Send` tags cross threads).
+event-listener = "5.4.2"
 pin-project-lite = "0.2"
 
 tokio = { version = "1", default-features = false, features = [
@@ -51,19 +43,12 @@ async-global-executor = { version = "3", optional = true }
 async-io = { version = "2", optional = true }
 async-std = { version = "1", optional = true }
 crossbeam-channel = { version = "0.5", optional = true }
-tracing = { version = "0.1", default-features = false, features = [
-    "std",
-    "attributes",
-], optional = true }
-console-subscriber = { version = "0.5.0", optional = true }
-# Heap profiler, enabled only by the `dhat-heap` feature (for `mem_profile`).
-dhat = { version = "0.3", optional = true }
-# Tracy profiler integration, enabled only by the `tracy` feature. The Tracy
-# client comes via `tracing_tracy::client` (no separate tracy-client dep, so
-# there's only one tracy-client-sys version).
-tracing-tracy = { version = "0.11", optional = true }
 
 [dev-dependencies]
+# Test-only heap profiling: the `heap` integration test uses dhat's profiler to
+# assert that sustained workloads don't grow live heap (leak regression). Never
+# part of the shipped dependency graph.
+dhat = "0.3"
 tokio = { version = "1", features = [
     "rt",
     "rt-multi-thread",
@@ -78,7 +63,14 @@ tokio = { version = "1", features = [
 futures = { version = "0.3", features = ["executor"] }
 criterion = "0.8.2"
 proptest = "1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# SQLite driver for the database-workload tests (`sqlite.rs`, `sqlite_load.rs`),
+# which exercise the blocking pool against a real DB.
+#
+# Must stay a dev-dependency: `bundled` compiles SQLite from source into the
+# test binaries, which is fine for tests but has no business in a consumer's
+# build. Nothing in `src/` may reference it — `cargo tree -e normal` must show
+# no rusqlite. `bundled` is deliberate over a system SQLite so the tests need no
+# preinstalled library on any platform.
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 # Tokio-only examples (they build the async pool via `Pool::builder()` and run on
@@ -114,10 +106,6 @@ name = "http_requests"
 required-features = ["runtime-tokio"]
 
 [[example]]
-name = "metrics"
-required-features = ["runtime-tokio"]
-
-[[example]]
 name = "multi_tenant"
 required-features = ["runtime-tokio"]
 
@@ -146,28 +134,12 @@ name = "task_group"
 required-features = ["runtime-tokio"]
 
 [[example]]
-name = "tracing_debug"
-required-features = ["runtime-tokio"]
-
-[[example]]
 name = "blocking"
 required-features = ["blocking"]
 
 [[example]]
-name = "metrics_export"
-required-features = ["metrics-export", "runtime-tokio"]
-
-[[example]]
 name = "smol_runtime"
 required-features = ["runtime-smol"]
-
-[[example]]
-name = "mem_profile"
-required-features = ["dhat-heap", "runtime-tokio"]
-
-[[example]]
-name = "tracy_profile"
-required-features = ["tracy", "runtime-tokio"]
 
 # Benchmarks construct a Tokio runtime directly, so they require the tokio
 # adapter (blocking-pool cases inside are additionally `#[cfg(feature =
@@ -182,6 +154,11 @@ name = "workload_bench"
 harness = false
 required-features = ["runtime-tokio"]
 
+[[bench]]
+name = "lifecycle_bench"
+harness = false
+required-features = ["runtime-tokio"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
@@ -191,14 +168,13 @@ lto = "thin"
 codegen-units = 1
 
 [package.metadata.docs.rs]
-features = ["runtime-tokio", "blocking", "tracing", "metrics-export"]
+features = ["runtime-tokio", "blocking"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
 unreachable_pub = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

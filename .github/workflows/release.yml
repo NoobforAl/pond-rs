@@ -11,7 +11,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  SAFE_FEATURES: "runtime-tokio,blocking,tracing"
+  SAFE_FEATURES: "runtime-tokio,blocking"
 
 jobs:
   # Gate: lints + tests must pass before we publish anything.
@@ -29,6 +29,22 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --all-targets --features "$SAFE_FEATURES" -- -D warnings
+      - name: clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      # Last line of defence before publishing: a test-only dependency that
+      # drifted into [dependencies] would otherwise ship to every consumer.
+      # rusqlite in particular compiles SQLite from source.
+      - name: Dev-dependencies stay out of the shipped graph
+        run: |
+          cargo tree -e normal --all-features > shipped-tree.txt
+          status=0
+          for crate in rusqlite dhat criterion proptest tempfile; do
+            if grep -qE "(^|[^[:alnum:]_-])$crate v" shipped-tree.txt; then
+              echo "::error::$crate is a dev-dependency but reached the shipped dependency graph"
+              status=1
+            fi
+          done
+          exit $status
       - name: Test (safe features)
         run: cargo test --features "$SAFE_FEATURES" --verbose
       - name: Test (no default features)

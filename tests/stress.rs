@@ -4,8 +4,11 @@
 //!
 //! Deterministic (fixed seeds, no `rand` dependency): each round drives many
 //! producers through interleaved submit / resize / cancel / stop and then asserts
-//! the pool quiesces with no hang, no panic escaping, and consistent metrics.
+//! the pool quiesces with no hang, no panic escaping, and every submitted task
+//! accounted for (tracked with shared atomics).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use pond::Pool;
@@ -19,8 +22,9 @@ fn mix(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Submit + resize churn, then graceful stop. Every admitted task must reach a
-/// terminal state (no leaked `outstanding`), and `stop_and_wait` must not hang.
+/// Submit + resize churn, then graceful stop. Every submitted task must have
+/// started by the time `stop_and_wait` returns (no leaked `outstanding`, which
+/// would hang the drain instead).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn submit_and_resize_then_stop_quiesces() {
     for seed in 0..16u64 {
@@ -29,17 +33,39 @@ async fn submit_and_resize_then_stop_quiesces() {
             .min_concurrency(1)
             .build();
 
+        // `submitted` bumps on submission; `started` bumps first thing in each
+        // task body (before any panic), so started == submitted after the drain
+        // proves every task reached a terminal state.
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+
         let mut producers = Vec::new();
         for p in 0..6u64 {
             let pool = pool.clone();
+            let submitted = submitted.clone();
+            let started = started.clone();
             producers.push(tokio::spawn(async move {
                 let mut s = mix(seed ^ p.wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 for _ in 0..200 {
                     s = mix(s);
                     match s % 8 {
                         0 => pool.resize((s as usize % 8) + 1),
-                        1 => pool.spawn(|| async { panic!("boom") }),
-                        _ => pool.spawn(|| async { tokio::task::yield_now().await }),
+                        1 => {
+                            submitted.fetch_add(1, Ordering::SeqCst);
+                            let started = started.clone();
+                            pool.spawn(move || async move {
+                                started.fetch_add(1, Ordering::SeqCst);
+                                panic!("boom")
+                            });
+                        }
+                        _ => {
+                            submitted.fetch_add(1, Ordering::SeqCst);
+                            let started = started.clone();
+                            pool.spawn(move || async move {
+                                started.fetch_add(1, Ordering::SeqCst);
+                                tokio::task::yield_now().await;
+                            });
+                        }
                     }
                 }
             }));
@@ -52,33 +78,37 @@ async fn submit_and_resize_then_stop_quiesces() {
             .await
             .expect("stop_and_wait hung");
 
-        let m = pool.metrics();
-        // No producer submitted after stop and nothing was dropped/cancelled, so
-        // every submission ran to success or panic.
-        assert_eq!(m.waiting, 0, "queued tasks leaked (seed {seed})");
-        assert_eq!(m.running_workers, 0, "running tasks leaked (seed {seed})");
         assert_eq!(
-            m.submitted,
-            m.successful + m.failed,
+            started.load(Ordering::SeqCst),
+            submitted.load(Ordering::SeqCst),
             "task accounting mismatch (seed {seed})"
         );
-        assert_eq!(m.completed, m.successful + m.failed);
     }
 }
 
-/// Cancellation racing a submit storm must not hang or leak outstanding tasks,
-/// and terminal counters must never exceed submissions.
+/// Cancellation racing a submit storm must not hang, and no task may run that
+/// was never submitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_during_load_quiesces() {
     for seed in 0..16u64 {
         let pool = Pool::builder().max_concurrency(2).build();
 
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+
         let mut producers = Vec::new();
         for _ in 0..4 {
             let pool = pool.clone();
+            let submitted = submitted.clone();
+            let started = started.clone();
             producers.push(tokio::spawn(async move {
                 for _ in 0..150 {
-                    pool.spawn(|| async { tokio::task::yield_now().await });
+                    submitted.fetch_add(1, Ordering::SeqCst);
+                    let started = started.clone();
+                    pool.spawn(move || async move {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                    });
                 }
             }));
         }
@@ -100,12 +130,9 @@ async fn cancel_during_load_quiesces() {
             .await
             .expect("stop_and_wait hung after cancel");
 
-        let m = pool.metrics();
-        assert_eq!(m.waiting, 0, "queued tasks leaked (seed {seed})");
-        assert_eq!(m.running_workers, 0, "running tasks leaked (seed {seed})");
         assert!(
-            m.successful + m.failed + m.canceled + m.dropped <= m.submitted,
-            "terminal counts exceeded submissions (seed {seed})"
+            started.load(Ordering::SeqCst) <= submitted.load(Ordering::SeqCst),
+            "started tasks exceeded submissions (seed {seed})"
         );
     }
 }

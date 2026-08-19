@@ -49,10 +49,6 @@ async fn pool_caps_concurrent_http_requests() {
     let observed = peak.load(Ordering::SeqCst);
     assert!(observed <= CAP, "peak {observed} exceeded the cap {CAP}");
     assert!(observed >= 2, "expected the requests to actually overlap");
-
-    let m = pool.metrics();
-    assert_eq!(m.submitted, REQUESTS as u64);
-    assert_eq!(m.successful, REQUESTS as u64);
 }
 
 async fn fetch(addr: SocketAddr, path: String) -> std::io::Result<usize> {

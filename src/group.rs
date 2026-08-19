@@ -114,10 +114,6 @@ impl<P: TaskSink, T: Send + 'static> ResultTaskGroup<P, T> {
     ///
     /// If any task panics or is cancelled, the group is cancelled and the first
     /// such [`Error`] is returned.
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(target = "pond", name = "pond.group.wait", level = "debug", skip_all)
-    )]
     pub async fn wait(self) -> Result<Vec<T>, Error> {
         let mut out = Vec::with_capacity(self.handles.len());
         let mut first_err: Option<Error> = None;
@@ -230,15 +226,6 @@ impl<P: TaskSink, T: Send + 'static, E: Send + 'static> TryTaskGroup<P, T, E> {
 
     /// Waits for all tasks. Returns their outputs in submission order, or the
     /// first error encountered (after cancelling the remaining queued tasks).
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            target = "pond",
-            name = "pond.try_group.wait",
-            level = "debug",
-            skip_all
-        )
-    )]
     pub async fn wait(self) -> Result<Vec<T>, GroupError<E>> {
         let mut out = Vec::with_capacity(self.handles.len());
         let mut first_err: Option<GroupError<E>> = None;
@@ -314,7 +301,6 @@ impl<S: Spawner, T: Send + 'static> GroupBuilder<S, T> {
             self.parent,
             self.max_concurrency,
             usize::MAX,
-            false,
             CancelToken::new(),
         );
         let token = self.cancel_token.unwrap_or_default();
@@ -329,7 +315,7 @@ impl<S: Spawner, T: Send + 'static> GroupBuilder<S, T> {
         K: ResultSink<T>,
     {
         let token = self.cancel_token.unwrap_or_default();
-        let sub = Subpool::from_parts(self.parent, self.max_concurrency, usize::MAX, false, token);
+        let sub = Subpool::from_parts(self.parent, self.max_concurrency, usize::MAX, token);
         StreamGroup::new(sub, Arc::new(sink))
     }
 }
@@ -371,7 +357,6 @@ impl<S: Spawner, T: Send + 'static, E: Send + 'static> TryGroupBuilder<S, T, E> 
             self.parent,
             self.max_concurrency,
             usize::MAX,
-            false,
             CancelToken::new(),
         );
         let token = self.cancel_token.unwrap_or_default();
@@ -385,7 +370,7 @@ impl<S: Spawner, T: Send + 'static, E: Send + 'static> TryGroupBuilder<S, T, E> 
         K: ResultSink<std::result::Result<T, E>>,
     {
         let token = self.cancel_token.unwrap_or_default();
-        let sub = Subpool::from_parts(self.parent, self.max_concurrency, usize::MAX, false, token);
+        let sub = Subpool::from_parts(self.parent, self.max_concurrency, usize::MAX, token);
         StreamGroup::new(sub, Arc::new(sink))
     }
 }

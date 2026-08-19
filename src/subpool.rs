@@ -4,7 +4,7 @@
 //! limiting how many of *its* tasks run at once. Stopping or cancelling a subpool
 //! does not affect the parent. A `Subpool` mirrors the [`Pool`] surface: it can
 //! submit (blocking / try / async / fire-and-forget / context-aware), resize,
-//! cancel, run task groups, and report the same metrics.
+//! cancel, and run task groups.
 
 use std::any::Any;
 use std::future::Future;
@@ -21,7 +21,7 @@ use crate::cancel::CancelToken;
 use crate::context::TaskContext;
 use crate::error::{panic_message, Error, Result};
 use crate::group::{ResultTaskGroup, TryTaskGroup};
-use crate::metrics::{Metrics, MetricsSnapshot};
+use crate::metrics::Metrics;
 use crate::options::QueueSize;
 use crate::pool::{Pool, StopHandle, TaskHandle};
 use crate::runtime::Spawner;
@@ -65,7 +65,6 @@ struct SubInner<S: Spawner> {
     // Serializes `resize` so concurrent calls don't interleave permit changes.
     resize_lock: std::sync::Mutex<()>,
     capacity: usize, // queued-task cap (usize::MAX == unbounded)
-    non_blocking: bool,
     metrics: Metrics,
     // Tasks admitted but not yet terminal; idle detection keys off this single
     // counter to avoid the dequeue/start race (see `Pool`'s `outstanding`).
@@ -81,20 +80,13 @@ struct SubInner<S: Spawner> {
 
 impl<S: Spawner> Subpool<S> {
     pub(crate) fn new(parent: Pool<S>, max_concurrency: usize) -> Self {
-        Self::from_parts(
-            parent,
-            max_concurrency,
-            usize::MAX,
-            false,
-            CancelToken::new(),
-        )
+        Self::from_parts(parent, max_concurrency, usize::MAX, CancelToken::new())
     }
 
     pub(crate) fn from_parts(
         parent: Pool<S>,
         max_concurrency: usize,
         capacity: usize,
-        non_blocking: bool,
         cancel: CancelToken,
     ) -> Self {
         let parent_max = parent.max_concurrency();
@@ -127,7 +119,6 @@ impl<S: Spawner> Subpool<S> {
             max_concurrency: AtomicUsize::new(effective),
             resize_lock: std::sync::Mutex::new(()),
             capacity,
-            non_blocking,
             metrics: Metrics::new(),
             outstanding: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -164,7 +155,9 @@ impl<S: Spawner> Subpool<S> {
     }
 
     /// Submits a task to the subpool. Never blocks; a stopped subpool or a full
-    /// bounded queue (when non-blocking) resolves the handle with an [`Error`].
+    /// bounded queue resolves the handle with an [`Error`]. Use
+    /// [`submit_async`](Self::submit_async) to wait for a queue slot instead of
+    /// rejecting.
     ///
     /// # Panics
     ///
@@ -183,17 +176,9 @@ impl<S: Spawner> Subpool<S> {
         if self.is_stopped() {
             return TaskHandle::resolved(Err(self.stop_error()));
         }
-        if self.inner.non_blocking {
-            if !self.inner.try_admit() {
-                self.inner.metrics.inc_dropped();
-                warn_event!(
-                    capacity = self.inner.capacity,
-                    "pond.subpool.submit dropped task: queue full"
-                );
-                return TaskHandle::resolved(Err(Error::QueueFull));
-            }
-        } else {
-            self.inner.admit();
+        if !self.inner.try_admit() {
+            self.inner.metrics.inc_dropped();
+            return TaskHandle::resolved(Err(Error::QueueFull));
         }
         self.spawn_task(task)
     }
@@ -274,7 +259,7 @@ impl<S: Spawner> Subpool<S> {
         T: Send + 'static,
     {
         // Queued + outstanding counters were already bumped by the caller's
-        // admission step (`admit`/`try_admit`).
+        // admission step (`try_admit`).
         let (tx, rx) = oneshot::channel();
         let run = self.inner.clone();
 
@@ -283,16 +268,8 @@ impl<S: Spawner> Subpool<S> {
         // cancellation, panic capture and metrics.
         self.inner.parent.spawn(move || async move {
             let _permit = if run.limited.load(Ordering::Relaxed) {
-                // Child span: time spent queued behind the subpool's concurrency
-                // cap. Compiled out without `tracing`.
-                let recv = run.permit_rx.recv();
-                #[cfg(feature = "tracing")]
-                let recv = tracing::Instrument::instrument(
-                    recv,
-                    tracing::debug_span!(target: "pond", "pond.task.wait_permit"),
-                );
-                match recv.await {
-                    Ok(()) => Some(SubPermit { inner: run.clone() }),
+                match run.permit_rx.recv().await {
+                    Ok(()) => Some(SubPermit { inner: &run }),
                     Err(_) => None, // channel closed (cancelled): proceed to dispose
                 }
             } else {
@@ -431,65 +408,11 @@ impl<S: Spawner> Subpool<S> {
     ) -> TryTaskGroup<Subpool<S>, T, E> {
         TryTaskGroup::new(self.clone())
     }
-
-    // --- Metrics accessors --------------------------------------------------
-
-    /// A snapshot of the subpool's own metrics.
-    pub fn metrics(&self) -> MetricsSnapshot {
-        self.inner.metrics.snapshot()
-    }
-
-    /// Number of subpool tasks currently running.
-    pub fn running_workers(&self) -> u64 {
-        self.inner.metrics.running()
-    }
-
-    /// Number of subpool tasks submitted.
-    pub fn submitted_tasks(&self) -> u64 {
-        self.inner.metrics.submitted()
-    }
-
-    /// Number of subpool tasks currently queued (not yet running).
-    pub fn waiting_tasks(&self) -> u64 {
-        self.inner.metrics.waiting()
-    }
-
-    /// Number of subpool tasks that completed successfully.
-    pub fn successful_tasks(&self) -> u64 {
-        self.inner.metrics.successful()
-    }
-
-    /// Number of subpool tasks that completed with an error or panic.
-    pub fn failed_tasks(&self) -> u64 {
-        self.inner.metrics.failed()
-    }
-
-    /// Number of completed subpool tasks (successful + failed).
-    pub fn completed_tasks(&self) -> u64 {
-        self.inner.metrics.completed()
-    }
-
-    /// Number of subpool tasks dropped because the queue was full.
-    pub fn dropped_tasks(&self) -> u64 {
-        self.inner.metrics.dropped()
-    }
-
-    /// Number of subpool tasks canceled before execution.
-    pub fn canceled_tasks(&self) -> u64 {
-        self.inner.metrics.canceled()
-    }
 }
 
 impl<S: Spawner> SubInner<S> {
     fn is_idle(&self) -> bool {
         self.outstanding.load(Ordering::Relaxed) == 0
-    }
-
-    /// Unconditionally admits a task (bumps queued + outstanding counters).
-    #[inline]
-    fn admit(&self) {
-        self.metrics.inc_waiting();
-        self.outstanding.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Atomically admits a task only if the bounded queue has room.
@@ -558,7 +481,6 @@ pub struct SubpoolBuilder<S: Spawner> {
     parent: Pool<S>,
     max_concurrency: usize,
     queue_size: QueueSize,
-    non_blocking: bool,
     cancel_token: CancelToken,
 }
 
@@ -568,7 +490,6 @@ impl<S: Spawner> SubpoolBuilder<S> {
             parent,
             max_concurrency: 0,
             queue_size: QueueSize::Unbounded,
-            non_blocking: false,
             cancel_token: CancelToken::new(),
         }
     }
@@ -585,9 +506,11 @@ impl<S: Spawner> SubpoolBuilder<S> {
         self
     }
 
-    /// Makes the subpool non-blocking: a full bounded queue rejects new tasks.
-    pub fn non_blocking(mut self, non_blocking: bool) -> Self {
-        self.non_blocking = non_blocking;
+    /// Accepted for builder parity; no effect on a subpool (whose submits never
+    /// block — a full bounded queue always rejects with
+    /// [`Error::QueueFull`]). See [`Subpool::submit_async`] for the
+    /// wait-for-a-slot path.
+    pub fn non_blocking(self, _non_blocking: bool) -> Self {
         self
     }
 
@@ -607,18 +530,20 @@ impl<S: Spawner> SubpoolBuilder<S> {
             self.parent,
             self.max_concurrency,
             self.queue_size.capacity(),
-            self.non_blocking,
             self.cancel_token,
         )
     }
 }
 
 /// Releases a subpool permit on drop.
-struct SubPermit<S: Spawner> {
-    inner: Arc<SubInner<S>>,
+///
+/// Borrows the subpool's `SubInner` (the task future owns an `Arc<SubInner>`
+/// for its whole life), so acquiring a permit costs no `Arc` clone.
+struct SubPermit<'a, S: Spawner> {
+    inner: &'a SubInner<S>,
 }
 
-impl<S: Spawner> Drop for SubPermit<S> {
+impl<S: Spawner> Drop for SubPermit<'_, S> {
     fn drop(&mut self) {
         let _ = self.inner.permit_tx.try_send(());
     }

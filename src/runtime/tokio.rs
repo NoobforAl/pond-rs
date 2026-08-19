@@ -38,6 +38,15 @@ impl Spawner for TokioSpawner {
         self.handle.spawn(future);
     }
 
+    fn spawn_unboxed<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        // Tokio's task cell stores the future inline, so this is a single
+        // allocation for the whole task.
+        self.handle.spawn(future);
+    }
+
     fn spawn_blocking(&self, f: Box<dyn FnOnce() + Send + 'static>) {
         self.handle.spawn_blocking(f);
     }

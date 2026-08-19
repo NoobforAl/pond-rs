@@ -20,5 +20,5 @@ async fn main() {
     println!("squares = {squares:?}");
 
     pool.stop_and_wait().await;
-    println!("completed {} tasks", pool.completed_tasks());
+    println!("completed {} tasks", squares.len());
 }

@@ -15,6 +15,7 @@
 //! boxed-future spawning and no `spawn_blocking`, so it can't satisfy this
 //! trait.)
 
+use std::future::Future;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -45,6 +46,25 @@ pub use self::async_std::AsyncStdSpawner;
 pub trait Spawner: Clone + Send + Sync + 'static {
     /// Spawns a detached async task that runs to completion on the runtime.
     fn spawn(&self, future: BoxFuture<'static, ()>);
+
+    /// Spawns a detached async task *without* boxing it first.
+    ///
+    /// This is the hot path: the pool spawns one future per submitted task, and
+    /// every runtime's `spawn` already allocates a task cell for it. Handing the
+    /// concrete future over lets that single allocation hold it inline, instead
+    /// of paying a second allocation for a `Box` the runtime then points at —
+    /// and it removes a pointer indirection from every poll.
+    ///
+    /// The default implementation boxes and defers to [`spawn`](Spawner::spawn),
+    /// so existing implementations keep working unchanged. `where Self: Sized`
+    /// keeps the trait object-safe despite the generic parameter.
+    fn spawn_unboxed<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+        Self: Sized,
+    {
+        self.spawn(Box::pin(future));
+    }
 
     /// Offloads a blocking closure onto a thread where blocking is acceptable.
     ///

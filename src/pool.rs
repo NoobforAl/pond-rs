@@ -17,12 +17,16 @@ use crate::cancel::CancelToken;
 use crate::context::TaskContext;
 use crate::error::{panic_message, Error, Result};
 use crate::group::{GroupBuilder, ResultTaskGroup, TryGroupBuilder, TryTaskGroup};
-use crate::metrics::{Metrics, MetricsSnapshot};
+use crate::metrics::Metrics;
 use crate::options::PoolBuilder;
 use crate::runtime::Spawner;
 use crate::submit::TaskSink;
 use crate::subpool::{Subpool, SubpoolBuilder};
 
+#[cfg(all(feature = "runtime-async-std", not(feature = "runtime-tokio")))]
+use crate::runtime::AsyncStdSpawner;
+#[cfg(all(feature = "runtime-smol", not(feature = "runtime-tokio")))]
+use crate::runtime::SmolSpawner;
 #[cfg(feature = "runtime-tokio")]
 use crate::runtime::TokioSpawner;
 
@@ -59,7 +63,6 @@ struct Inner<S: Spawner> {
     min_concurrency: usize, // resize floor (0 == none)
     capacity: usize,        // queue capacity (usize::MAX == unbounded)
     panic_recovery: bool,
-    non_blocking: bool,
     closed: AtomicBool,
     cancel: CancelToken,
     metrics: Metrics,
@@ -71,9 +74,9 @@ struct Inner<S: Spawner> {
     outstanding: AtomicUsize,
     idle: Event, // notified when the pool becomes fully idle
     slot: Event, // notified when a queue slot frees up
-    // Notified when the last `Pool` handle drops, so the background watcher /
-    // metrics tasks (which hold a `Weak<Inner>`) wake and terminate instead of
-    // parking forever. See `Drop for Inner`.
+    // Notified when the last `Pool` handle drops, so the background watcher
+    // (which holds a `Weak<Inner>`) wakes and terminates instead of parking
+    // forever. See `Drop for Inner`.
     shutdown: Arc<Event>,
     task_data: Option<Arc<dyn Any + Send + Sync>>,
     name: Option<String>,
@@ -91,6 +94,28 @@ impl Pool<TokioSpawner> {
     }
 }
 
+// On a non-Tokio build, `Pool::builder()` binds to the enabled runtime's global
+// executor instead, so code written against `Pool::builder()` (examples,
+// doctests) compiles under any single-runtime feature set. When `runtime-tokio`
+// is enabled, the impl above wins regardless of the other features.
+#[cfg(all(feature = "runtime-smol", not(feature = "runtime-tokio")))]
+impl Pool<SmolSpawner> {
+    /// Starts building a pool backed by the smol global executor
+    /// (`async-global-executor`). Worker threads start lazily on first use.
+    pub fn builder() -> PoolBuilder<SmolSpawner> {
+        PoolBuilder::new(SmolSpawner::new())
+    }
+}
+
+#[cfg(all(feature = "runtime-async-std", not(feature = "runtime-tokio")))]
+impl Pool<AsyncStdSpawner> {
+    /// Starts building a pool backed by the `async-std` global executor, which
+    /// starts on demand.
+    pub fn builder() -> PoolBuilder<AsyncStdSpawner> {
+        PoolBuilder::new(AsyncStdSpawner::new())
+    }
+}
+
 impl<S: Spawner> Pool<S> {
     /// Starts building a pool backed by a custom [`Spawner`].
     pub fn builder_with(spawner: S) -> PoolBuilder<S> {
@@ -102,7 +127,6 @@ impl<S: Spawner> Pool<S> {
         let deadline = b.deadline.take();
         let task_data = b.task_data.take();
         let name = b.pool_name.take();
-        let metrics_cfg = b.metrics.take();
         let limited = b.max_concurrency != 0;
         // An unbounded token channel: `send` never blocks, so releasing a permit
         // is always immediate.
@@ -123,7 +147,6 @@ impl<S: Spawner> Pool<S> {
             min_concurrency: b.min_concurrency,
             capacity: b.queue_size.capacity(),
             panic_recovery: b.panic_recovery,
-            non_blocking: b.non_blocking,
             closed: AtomicBool::new(false),
             cancel: b.cancel_token,
             metrics: Metrics::new(),
@@ -169,25 +192,6 @@ impl<S: Spawner> Pool<S> {
             inner.cancel.cancel_after(&inner.spawner, dur);
         }
 
-        // Periodic metrics export: push a snapshot to the sink every interval
-        // until the pool stops or is dropped. Runtime-agnostic (uses
-        // `Spawner::sleep`). Holds a `Weak<Inner>` so it cannot keep the pool
-        // alive; the strong upgrade is dropped before each sleep.
-        if let Some(cfg) = metrics_cfg {
-            let weak = Arc::downgrade(&inner);
-            let spawner = inner.spawner.clone();
-            inner.spawner.spawn(Box::pin(async move {
-                loop {
-                    spawner.sleep(cfg.interval).await;
-                    let Some(inner) = weak.upgrade() else { break };
-                    if inner.closed.load(Ordering::Relaxed) || inner.cancel.is_cancelled() {
-                        break;
-                    }
-                    cfg.sink.send(inner.metrics.snapshot());
-                }
-            }));
-        }
-
         Pool { inner }
     }
 
@@ -199,13 +203,10 @@ impl<S: Spawner> Pool<S> {
 
     /// Submits a task, returning a [`TaskHandle`] that resolves with its result.
     ///
-    /// This call never blocks. If the pool is stopped, or it is non-blocking and
-    /// the queue is full, the returned handle resolves with the corresponding
-    /// [`Error`] (the task is not run).
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(target = "pond", name = "pond.submit", level = "debug", skip_all)
-    )]
+    /// This call never blocks. If the pool is stopped, or its bounded queue is
+    /// full, the returned handle resolves with the corresponding [`Error`] (the
+    /// task is not run). Use [`submit_async`](Self::submit_async) to wait for a
+    /// queue slot instead of rejecting.
     pub fn submit<F, Fut, T>(&self, task: F) -> TaskHandle<T>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -218,38 +219,41 @@ impl<S: Spawner> Pool<S> {
             return TaskHandle::resolved(Err(self.stop_error()));
         }
 
-        if self.inner.non_blocking {
-            if !self.inner.try_admit() {
-                self.inner.metrics.inc_dropped();
-                warn_event!(
-                    capacity = self.inner.capacity,
-                    "pond.submit dropped task: queue full"
-                );
-                return TaskHandle::resolved(Err(Error::QueueFull));
-            }
-        } else {
-            // `submit` never blocks, so a bounded blocking pool admits past its
-            // queue bound here; backpressure is `submit_async`'s job.
-            self.inner.admit();
+        // Bounded queues reject when full (submit never blocks, so a full queue
+        // can only reject — never grow past its capacity). Unbounded queues
+        // (`capacity == usize::MAX`) always admit.
+        if !self.inner.try_admit() {
+            self.inner.metrics.inc_dropped();
+            return TaskHandle::resolved(Err(Error::QueueFull));
         }
 
         let (tx, rx) = oneshot::channel();
-        self.spawn_task(task, tx);
+        self.spawn_task(task, Some(tx));
         TaskHandle::new(rx)
     }
 
-    /// Submits a task fire-and-forget, discarding its result handle.
+    /// Submits a task fire-and-forget, without creating a result channel.
     ///
-    /// Fire-and-forget submission. The task still runs; only the handle (and
-    /// therefore the result) is dropped.
+    /// The task still runs; because no [`TaskHandle`] is wanted, no oneshot
+    /// channel is allocated (a fire-and-forget storm therefore costs less
+    /// memory than the equivalent `submit` + dropped-handle loop). On a
+    /// stopped pool the task is not run; on a full bounded queue it is dropped.
     pub fn spawn<F, Fut, T>(&self, task: F)
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        let handle = self.submit(task);
-        drop(handle);
+        self.inner.metrics.inc_submitted();
+
+        if self.is_stopped() {
+            return;
+        }
+        if !self.inner.try_admit() {
+            self.inner.metrics.inc_dropped();
+            return;
+        }
+        self.spawn_task(task, None);
     }
 
     /// Submits a task that receives a [`TaskContext`], returning a handle.
@@ -305,10 +309,6 @@ impl<S: Spawner> Pool<S> {
     ///
     /// Unlike [`submit`](Self::submit), the error is returned directly rather
     /// than surfaced through the handle.
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(target = "pond", name = "pond.try_submit", level = "debug", skip_all)
-    )]
     pub fn try_submit<F, Fut, T>(&self, task: F) -> Result<TaskHandle<T>>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -326,7 +326,7 @@ impl<S: Spawner> Pool<S> {
         }
 
         let (tx, rx) = oneshot::channel();
-        self.spawn_task(task, tx);
+        self.spawn_task(task, Some(tx));
         Ok(TaskHandle::new(rx))
     }
 
@@ -334,18 +334,6 @@ impl<S: Spawner> Pool<S> {
     /// backpressure for bounded queues).
     ///
     /// Rejects only if the pool is stopped.
-    // `submit_async` intentionally returns the awaitable `TaskHandle`; under
-    // `tracing::instrument` clippy otherwise flags it as yielding an awaitable.
-    #[allow(clippy::async_yields_async)]
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(
-            target = "pond",
-            name = "pond.submit_async",
-            level = "debug",
-            skip_all
-        )
-    )]
     pub async fn submit_async<F, Fut, T>(&self, task: F) -> TaskHandle<T>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -375,40 +363,36 @@ impl<S: Spawner> Pool<S> {
         }
 
         let (tx, rx) = oneshot::channel();
-        self.spawn_task(task, tx);
+        self.spawn_task(task, Some(tx));
         TaskHandle::new(rx)
     }
 
-    fn spawn_task<F, Fut, T>(&self, task: F, tx: oneshot::Sender<Result<T>>)
+    fn spawn_task<F, Fut, T>(&self, task: F, tx: Option<oneshot::Sender<Result<T>>>)
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
         // The queued metric and the outstanding (idle) counter were already
-        // bumped by the caller's admission step (`admit`/`try_admit`).
+        // bumped by the caller's admission step (`try_admit`). `tx` is `None`
+        // for fire-and-forget tasks, which skip the result channel entirely.
         //
         // A single `Arc` clone moved into the task future (the worker body). The
         // submit path itself uses `&self.inner`, saving one inc/dec per submit.
         let inner = self.inner.clone();
+        let mut tx = tx;
         let task_fut = async move {
             // Acquire a permit when concurrency is limited.
             // ordering: `Relaxed` — this flag only gates the fast path; the permit
             // handoff itself is synchronized by the channel.
+            //
+            // The guard borrows `inner` (which the task future owns for its
+            // whole life) rather than cloning the sender, so acquiring a permit
+            // costs no atomic refcount traffic.
             let _permit = if inner.limited.load(Ordering::Relaxed) {
-                // The `pond.task.wait_permit` child span's duration is exactly the
-                // time this task spent queued behind the concurrency limit — the
-                // most direct signal for explaining tail latency. Compiled out
-                // without `tracing`.
-                let recv = inner.permit_rx.recv();
-                #[cfg(feature = "tracing")]
-                let recv = tracing::Instrument::instrument(
-                    recv,
-                    tracing::debug_span!(target: "pond", "pond.task.wait_permit"),
-                );
-                match recv.await {
+                match inner.permit_rx.recv().await {
                     Ok(()) => Some(PermitGuard {
-                        tx: inner.permit_tx.clone(),
+                        tx: &inner.permit_tx,
                     }),
                     Err(_) => None, // channel closed (cancelled): proceed to dispose
                 }
@@ -422,8 +406,9 @@ impl<S: Spawner> Pool<S> {
             // Cancelled tasks are disposed without running.
             if inner.cancel.is_cancelled() {
                 inner.metrics.inc_canceled();
-                trace_event!("pond.task canceled before execution");
-                let _ = tx.send(Err(inner.cancel.cause().unwrap_or(Error::Canceled)));
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(Err(inner.cancel.cause().unwrap_or(Error::Canceled)));
+                }
                 inner.dispatch_done();
                 return;
             }
@@ -433,20 +418,25 @@ impl<S: Spawner> Pool<S> {
             // guard, so this still runs if a non-recovered task panics and
             // unwinds. Without it, `running` would leak and `stop_and_wait` (which
             // waits for the pool to go idle) could hang forever.
-            let _running = RunningGuard {
-                inner: inner.clone(),
-            };
+            //
+            // Borrows `inner` instead of cloning the `Arc`: the guard lives
+            // strictly inside this future, which owns `inner` and outlives it
+            // even while unwinding.
+            let _running = RunningGuard { inner: &inner };
 
             if inner.panic_recovery {
                 match AssertUnwindSafe(task()).catch_unwind().await {
                     Ok(value) => {
                         inner.metrics.inc_successful();
-                        let _ = tx.send(Ok(value));
+                        if let Some(tx) = tx.take() {
+                            let _ = tx.send(Ok(value));
+                        }
                     }
                     Err(payload) => {
                         inner.metrics.inc_failed();
-                        trace_event!("pond.task panicked");
-                        let _ = tx.send(Err(Error::Panicked(panic_message(payload))));
+                        if let Some(tx) = tx.take() {
+                            let _ = tx.send(Err(Error::Panicked(panic_message(payload))));
+                        }
                     }
                 }
             } else {
@@ -455,29 +445,22 @@ impl<S: Spawner> Pool<S> {
                 // `RunningGuard` above still runs its cleanup during unwinding.
                 let value = task().await;
                 inner.metrics.inc_successful();
-                let _ = tx.send(Ok(value));
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(Ok(value));
+                }
             }
         };
 
-        // The `pond.task` span's duration is the task's wall-clock time, including
-        // any wait for a concurrency permit. Compiled out without `tracing`.
-        #[cfg(feature = "tracing")]
-        let task_fut = tracing::Instrument::instrument(
-            task_fut,
-            tracing::debug_span!(target: "pond", "pond.task"),
-        );
-
-        self.inner.spawner.spawn(Box::pin(task_fut));
+        // Hand the concrete future to the runtime unboxed: the runtime's own
+        // task allocation stores it inline, so the pool no longer pays a
+        // separate `Box` allocation (and an indirection per poll) per task.
+        self.inner.spawner.spawn_unboxed(task_fut);
     }
 
     /// Signals the pool to stop accepting new tasks and returns a future that
     /// completes once all queued and running tasks have finished.
     ///
     /// Already-queued tasks are still run to completion (graceful drain).
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(target = "pond", name = "pond.stop", level = "debug", skip_all)
-    )]
     pub fn stop(&self) -> StopHandle {
         // ordering: `Relaxed` — a plain stop flag; draining waits on the `idle`
         // event, which carries its own synchronization.
@@ -496,10 +479,6 @@ impl<S: Spawner> Pool<S> {
 
     /// Cancels the pool: queued tasks are abandoned (resolving with
     /// [`Error::Canceled`]) while running tasks are allowed to finish.
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(target = "pond", name = "pond.cancel", level = "debug", skip_all)
-    )]
     pub fn cancel(&self) {
         self.inner.cancel.cancel();
     }
@@ -530,10 +509,6 @@ impl<S: Spawner> Pool<S> {
     /// `0` makes concurrency unbounded. Growing adds permits immediately;
     /// shrinking retires permits as running tasks release them (in-flight tasks
     /// are never interrupted).
-    #[cfg_attr(
-        feature = "tracing",
-        tracing::instrument(target = "pond", name = "pond.resize", level = "debug", skip(self))
-    )]
     pub fn resize(&self, max_concurrency: usize) {
         let inner = &self.inner;
         // Serialize against other resizes so permit reconciliation is atomic.
@@ -585,54 +560,7 @@ impl<S: Spawner> Pool<S> {
         }
     }
 
-    // --- Metrics accessors --------------------------------------------------
-
-    /// Returns a point-in-time snapshot of all metrics.
-    pub fn metrics(&self) -> MetricsSnapshot {
-        self.inner.metrics.snapshot()
-    }
-
-    /// Number of tasks currently executing (those that have acquired a permit and
-    /// are running). Queued-but-not-started tasks are reported by
-    /// [`waiting_tasks`](Self::waiting_tasks).
-    pub fn running_workers(&self) -> u64 {
-        self.inner.metrics.running()
-    }
-
-    /// Total number of tasks ever submitted (including dropped).
-    pub fn submitted_tasks(&self) -> u64 {
-        self.inner.metrics.submitted()
-    }
-
-    /// Number of tasks currently queued (not yet running).
-    pub fn waiting_tasks(&self) -> u64 {
-        self.inner.metrics.waiting()
-    }
-
-    /// Number of tasks that completed successfully.
-    pub fn successful_tasks(&self) -> u64 {
-        self.inner.metrics.successful()
-    }
-
-    /// Number of tasks that completed with an error or panic.
-    pub fn failed_tasks(&self) -> u64 {
-        self.inner.metrics.failed()
-    }
-
-    /// Number of completed tasks (successful + failed).
-    pub fn completed_tasks(&self) -> u64 {
-        self.inner.metrics.completed()
-    }
-
-    /// Number of tasks dropped because the queue was full.
-    pub fn dropped_tasks(&self) -> u64 {
-        self.inner.metrics.dropped()
-    }
-
-    /// Number of tasks canceled before execution.
-    pub fn canceled_tasks(&self) -> u64 {
-        self.inner.metrics.canceled()
-    }
+    // --- Concurrency config ---------------------------------------------------
 
     /// The configured maximum concurrency (`0` == unbounded).
     pub fn max_concurrency(&self) -> usize {
@@ -696,16 +624,9 @@ impl<S: Spawner> Inner<S> {
         self.outstanding.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Unconditionally admits a task: bumps the queued metric and the
-    /// outstanding (idle-tracking) counter. Used by the never-blocking `submit`.
-    #[inline]
-    fn admit(&self) {
-        self.metrics.inc_waiting();
-        self.inc_outstanding();
-    }
-
     /// Atomically admits a task only if the bounded queue has room, closing the
     /// check-then-increment race. Returns `false` (admitting nothing) when full.
+    /// An unbounded queue (`capacity == usize::MAX`) always admits.
     #[inline]
     fn try_admit(&self) -> bool {
         if self.metrics.try_reserve_waiting(self.capacity) {
@@ -749,18 +670,21 @@ impl<S: Spawner> Drop for Inner<S> {
     fn drop(&mut self) {
         // The last `Pool` handle is gone and no task futures reference us (they
         // each hold a strong `Arc<Inner>` while live), so wake the background
-        // watcher / metrics tasks — which hold only a `Weak<Inner>` — so they
-        // observe the shutdown and terminate instead of leaking as parked tasks.
+        // watcher — which holds only a `Weak<Inner>` — so it observes the
+        // shutdown and terminates instead of leaking as a parked task.
         self.shutdown.notify(usize::MAX);
     }
 }
 
 /// Guard returned to a running task; releases its permit on drop.
-struct PermitGuard {
-    tx: async_channel::Sender<()>,
+///
+/// Borrows the pool's permit sender (the task future owns an `Arc<Inner>` for
+/// its whole life), so a permit acquisition costs no `Arc` clone.
+struct PermitGuard<'a> {
+    tx: &'a async_channel::Sender<()>,
 }
 
-impl Drop for PermitGuard {
+impl Drop for PermitGuard<'_> {
     fn drop(&mut self) {
         let _ = self.tx.try_send(());
     }
@@ -769,11 +693,11 @@ impl Drop for PermitGuard {
 /// Decrements the running-task tally and signals idle on drop — including during
 /// unwinding, so a non-recovered task panic can't leave `running` permanently
 /// elevated (which would wedge [`Pool::stop_and_wait`]).
-struct RunningGuard<S: Spawner> {
-    inner: Arc<Inner<S>>,
+struct RunningGuard<'a, S: Spawner> {
+    inner: &'a Inner<S>,
 }
 
-impl<S: Spawner> Drop for RunningGuard<S> {
+impl<S: Spawner> Drop for RunningGuard<'_, S> {
     fn drop(&mut self) {
         self.inner.metrics.dec_running();
         self.inner.dispatch_done();
@@ -784,18 +708,33 @@ impl<S: Spawner> Drop for RunningGuard<S> {
 ///
 /// Dropping the handle does **not** cancel the task; it simply discards the result.
 pub struct TaskHandle<T> {
-    rx: oneshot::Receiver<Result<T>>,
+    state: HandleState<T>,
+}
+
+// Sound: nothing inside is structurally pinned — the oneshot receiver is `Unpin`
+// and the resolved slot is plain data — so the handle can always be moved out of
+// a `Pin` regardless of `T`.
+impl<T> Unpin for TaskHandle<T> {}
+
+enum HandleState<T> {
+    /// Waiting on the worker's oneshot.
+    Chan(oneshot::Receiver<Result<T>>),
+    /// Already resolved at creation (e.g. a rejected submission). Stored
+    /// inline, so a rejected `submit` allocates nothing.
+    Done(Option<Result<T>>),
 }
 
 impl<T> TaskHandle<T> {
     pub(crate) fn new(rx: oneshot::Receiver<Result<T>>) -> Self {
-        Self { rx }
+        Self {
+            state: HandleState::Chan(rx),
+        }
     }
 
     pub(crate) fn resolved(result: Result<T>) -> Self {
-        let (tx, rx) = oneshot::channel();
-        let _ = tx.send(result);
-        Self { rx }
+        Self {
+            state: HandleState::Done(Some(result)),
+        }
     }
 }
 
@@ -803,12 +742,15 @@ impl<T> Future for TaskHandle<T> {
     type Output = Result<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match Pin::new(&mut self.rx).poll(cx) {
-            Poll::Ready(Ok(result)) => Poll::Ready(result),
-            // Sender dropped without sending: the task panicked without recovery
-            // (or the pool was torn down) — treat as cancellation.
-            Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Canceled)),
-            Poll::Pending => Poll::Pending,
+        match &mut self.state {
+            HandleState::Done(slot) => Poll::Ready(slot.take().unwrap_or(Err(Error::Canceled))),
+            HandleState::Chan(rx) => match Pin::new(rx).poll(cx) {
+                Poll::Ready(Ok(result)) => Poll::Ready(result),
+                // Sender dropped without sending: the task panicked without recovery
+                // (or the pool was torn down) — treat as cancellation.
+                Poll::Ready(Err(_)) => Poll::Ready(Err(Error::Canceled)),
+                Poll::Pending => Poll::Pending,
+            },
         }
     }
 }
@@ -849,5 +791,41 @@ impl<S: Spawner> TaskSink for Pool<S> {
 
     fn task_data(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         self.task_data()
+    }
+}
+
+// Folded in from the former `tests/proptest_metrics.rs`: once the pool has
+// drained, every submitted task must be accounted for in exactly one terminal
+// bucket and nothing may be left running or queued. Uses the internal counters
+// directly (they are no longer part of the public API).
+#[cfg(all(test, feature = "runtime-tokio"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn counters_balance_after_drain() {
+        let pool = Pool::builder().max_concurrency(4).build();
+        let mut handles = Vec::new();
+        for i in 0..24 {
+            handles.push(pool.submit(move || async move {
+                if i % 5 == 0 {
+                    panic!("boom");
+                }
+                i
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        pool.stop_and_wait().await;
+
+        let m = &pool.inner.metrics;
+        assert_eq!(m.submitted(), 24);
+        assert_eq!(m.successful() + m.failed(), 24, "every task is terminal");
+        assert_eq!(m.waiting(), 0, "no tasks should remain queued");
+        assert_eq!(m.running(), 0, "no workers should remain running");
+        // Unbounded queue + no external cancel => nothing dropped or canceled.
+        assert_eq!(m.dropped(), 0);
+        assert_eq!(m.canceled(), 0);
     }
 }

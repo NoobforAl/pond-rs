@@ -6,7 +6,7 @@
 //! project, not a binding or a port.
 //!
 //! pond provides two flavours of pool that share the same concepts (bounded
-//! concurrency, task handles, groups, subpools, metrics, graceful shutdown):
+//! concurrency, task handles, groups, subpools, graceful shutdown):
 //!
 //! * an **async** [`Pool`] that runs futures with bounded concurrency on a
 //!   pluggable async runtime (Tokio out of the box), and
@@ -42,8 +42,7 @@
 //!   receive one before running and returns it (via an RAII guard) when done.
 //!   This makes "wait for a free slot" a plain channel `recv().await` — no
 //!   condition variables — and makes [`resize`](Pool::resize) just add or drain
-//!   permits. The `pond.task.wait_permit` span (with the `tracing` feature) times
-//!   exactly this wait.
+//!   permits.
 //! * **Subpools layer a second gate.** A [`Subpool`] runs on its parent's workers
 //!   but holds its own permit channel, so a task must acquire *both* a subpool
 //!   permit and a parent permit. That is how a subpool caps its share of the
@@ -54,26 +53,16 @@
 //! * **Cancellation is an `event-listener` broadcast.** [`CancelToken`] flips an
 //!   atomic and wakes all waiters; the pool spawns one watcher task that reacts
 //!   by closing the permit channels and notifying idle/slot listeners. That
-//!   watcher (and the optional metrics-export task) holds only a `Weak` reference
-//!   to the pool's shared state, so **dropping the last [`Pool`] handle frees it
-//!   and stops those background tasks** even if you never call `stop`/`cancel`.
-//! * **Metrics are independent atomic counters** ([`MetricsSnapshot`]). Because no
-//!   counter publishes other memory, `Relaxed` ordering is correct and cheapest.
+//!   watcher holds only a `Weak` reference to the pool's shared state, so
+//!   **dropping the last [`Pool`] handle frees it and stops the watcher** even
+//!   if you never call `stop`/`cancel`.
+//! * **Internal counters are independent atomics.** Because no counter publishes
+//!   other memory, `Relaxed` ordering is correct and cheapest.
 //!
 //! The async [`Pool`] never assumes Tokio: every runtime touchpoint goes through
 //! the [`Spawner`] trait, so the same logic runs on Tokio, smol, or async-std.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
-
-// The tokio-console integration relies on Tokio's unstable task instrumentation,
-// which is only available when the whole build sets `--cfg tokio_unstable`.
-#[cfg(all(feature = "tokio-console", not(tokio_unstable)))]
-compile_error!(
-    "the `tokio-console` feature requires building with RUSTFLAGS=\"--cfg tokio_unstable\""
-);
-
-#[macro_use]
-mod macros;
 
 mod cancel;
 mod context;
@@ -84,7 +73,6 @@ mod runtime;
 pub use crate::cancel::CancelToken;
 pub use crate::context::TaskContext;
 pub use crate::error::{Error, Result};
-pub use crate::metrics::MetricsSnapshot;
 pub use crate::runtime::Spawner;
 
 #[cfg(feature = "runtime-tokio")]
@@ -110,7 +98,7 @@ pub use crate::group::{
     GroupBuilder, GroupError, ResultTaskGroup, StreamGroup, TryGroupBuilder, TryTaskGroup,
 };
 pub use crate::join::join_all;
-pub use crate::options::{MetricsConfig, PoolBuilder, PoolConfig, QueueSize};
+pub use crate::options::{PoolBuilder, PoolConfig, QueueSize};
 pub use crate::pool::{Pool, StopHandle, TaskHandle};
 pub use crate::result_pool::ResultPool;
 pub use crate::schedule::{Job, RetryPolicy, ScheduledTask};
@@ -131,8 +119,3 @@ pub use crate::default::{
 #[cfg(feature = "blocking")]
 #[cfg_attr(docsrs, doc(cfg(feature = "blocking")))]
 pub mod blocking;
-
-// Debug/monitoring helpers (tracing spans + tokio-console).
-#[cfg(feature = "tracing")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tracing")))]
-pub mod monitor;

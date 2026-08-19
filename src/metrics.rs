@@ -65,6 +65,11 @@ impl Metrics {
         self.inner.submitted.fetch_add(1, Ordering::Relaxed);
     }
 
+    // Only the blocking pool bumps this directly; the async pool goes through
+    // `try_reserve_waiting`, which enforces the queue bound at the same time.
+    // Without the gate this is dead code in a build without `blocking`, which
+    // CI (`-D warnings`) treats as an error.
+    #[cfg(any(feature = "blocking", test))]
     #[inline]
     pub(crate) fn inc_waiting(&self) {
         self.inner.waiting.fetch_add(1, Ordering::Relaxed);
@@ -79,6 +84,15 @@ impl Metrics {
     /// the queue is already full.
     #[inline]
     pub(crate) fn try_reserve_waiting(&self, capacity: usize) -> bool {
+        // An unbounded queue can never reject, so the CAS loop below has no work
+        // to do: skip straight to an unconditional `fetch_add`. This matters
+        // under many concurrent submitters, where a CAS loop has to retry every
+        // time another producer wins the race but `fetch_add` never does.
+        if capacity == usize::MAX {
+            self.inner.waiting.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+
         let cap = capacity as u64;
         let mut cur = self.inner.waiting.load(Ordering::Relaxed);
         loop {
@@ -121,7 +135,13 @@ impl Metrics {
     pub(crate) fn inc_canceled(&self) {
         self.inner.canceled.fetch_add(1, Ordering::Relaxed);
     }
+}
 
+// Read accessors exist only for the crate's own tests (the counters themselves
+// are live machinery — admission/backpressure key off them — but nothing in the
+// shipped library reads them back).
+#[cfg(test)]
+impl Metrics {
     #[inline]
     pub(crate) fn running(&self) -> u64 {
         self.inner.running_workers.load(Ordering::Relaxed)
@@ -151,11 +171,6 @@ impl Metrics {
     }
 
     #[inline]
-    pub(crate) fn completed(&self) -> u64 {
-        self.successful() + self.failed()
-    }
-
-    #[inline]
     pub(crate) fn dropped(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
     }
@@ -182,117 +197,28 @@ impl Metrics {
     }
 }
 
-/// An immutable, point-in-time view of a pool's metrics.
-///
-/// Obtain one via [`Pool::metrics`](crate::Pool::metrics). Individual counters
-/// are also exposed directly on the pool (e.g. `running_workers()`).
+/// An internal, point-in-time view of a pool's counters, for the crate's own
+/// tests. Not part of the public API.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct MetricsSnapshot {
+pub(crate) struct MetricsSnapshot {
     /// Number of tasks currently executing (have acquired a concurrency permit
     /// and are running). Queued-but-not-started tasks are counted by `waiting`.
-    pub running_workers: u64,
+    pub(crate) running_workers: u64,
     /// Total number of tasks ever submitted (including dropped ones).
-    pub submitted: u64,
+    pub(crate) submitted: u64,
     /// Number of tasks currently queued but not yet running.
-    pub waiting: u64,
+    pub(crate) waiting: u64,
     /// Number of tasks that completed successfully.
-    pub successful: u64,
+    pub(crate) successful: u64,
     /// Number of tasks that completed with an error or a panic.
-    pub failed: u64,
+    pub(crate) failed: u64,
     /// Number of completed tasks (`successful + failed`).
-    pub completed: u64,
+    pub(crate) completed: u64,
     /// Number of tasks dropped because the queue was full (non-blocking pools).
-    pub dropped: u64,
+    pub(crate) dropped: u64,
     /// Number of tasks canceled before execution (e.g. via the cancel token).
-    pub canceled: u64,
-}
-
-#[cfg(feature = "metrics-export")]
-#[cfg_attr(docsrs, doc(cfg(feature = "metrics-export")))]
-impl MetricsSnapshot {
-    /// Renders this snapshot in [Prometheus text exposition format].
-    ///
-    /// `pool_name` is attached as a `pool` label on every metric. Cumulative
-    /// tallies are emitted as `counter`s (with the conventional `_total` suffix)
-    /// and live values as `gauge`s. The result is a ready-to-serve scrape body,
-    /// produced with `std::fmt` only — no extra dependency.
-    ///
-    /// [Prometheus text exposition format]: https://prometheus.io/docs/instrumenting/exposition_formats/
-    ///
-    /// ```
-    /// use pond::MetricsSnapshot;
-    ///
-    /// let text = MetricsSnapshot::default().to_prometheus_text("default");
-    /// assert!(text.contains("pond_tasks_submitted_total{pool=\"default\"} 0"));
-    /// assert!(text.contains("# TYPE pond_running_workers gauge"));
-    /// ```
-    pub fn to_prometheus_text(&self, pool_name: &str) -> String {
-        use std::fmt::Write as _;
-
-        // Escape the label value per the exposition format (backslash, quote, LF).
-        let label = pool_name
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n");
-
-        let mut out = String::new();
-        let mut metric = |name: &str, kind: &str, help: &str, value: u64| {
-            let _ = writeln!(out, "# HELP {name} {help}");
-            let _ = writeln!(out, "# TYPE {name} {kind}");
-            let _ = writeln!(out, "{name}{{pool=\"{label}\"}} {value}");
-        };
-
-        metric(
-            "pond_tasks_submitted_total",
-            "counter",
-            "Total tasks ever submitted (including dropped ones).",
-            self.submitted,
-        );
-        metric(
-            "pond_tasks_successful_total",
-            "counter",
-            "Tasks that completed successfully.",
-            self.successful,
-        );
-        metric(
-            "pond_tasks_failed_total",
-            "counter",
-            "Tasks that completed with an error or panic.",
-            self.failed,
-        );
-        metric(
-            "pond_tasks_completed_total",
-            "counter",
-            "Completed tasks (successful + failed).",
-            self.completed,
-        );
-        metric(
-            "pond_tasks_dropped_total",
-            "counter",
-            "Tasks dropped because the queue was full.",
-            self.dropped,
-        );
-        metric(
-            "pond_tasks_canceled_total",
-            "counter",
-            "Tasks canceled before execution.",
-            self.canceled,
-        );
-        metric(
-            "pond_running_workers",
-            "gauge",
-            "Tasks currently executing (holding a concurrency permit).",
-            self.running_workers,
-        );
-        metric(
-            "pond_waiting_tasks",
-            "gauge",
-            "Tasks currently queued but not yet running.",
-            self.waiting,
-        );
-
-        out
-    }
+    pub(crate) canceled: u64,
 }
 
 #[cfg(test)]
@@ -328,29 +254,6 @@ mod tests {
         let m2 = m.clone();
         m.inc_submitted();
         assert_eq!(m2.snapshot().submitted, 1);
-    }
-
-    #[cfg(feature = "metrics-export")]
-    #[test]
-    fn prometheus_text_renders_counters_and_gauges() {
-        let m = Metrics::new();
-        m.inc_submitted();
-        m.inc_successful();
-        m.inc_running();
-        let text = m.snapshot().to_prometheus_text("api");
-
-        assert!(text.contains("# TYPE pond_tasks_submitted_total counter"));
-        assert!(text.contains("pond_tasks_submitted_total{pool=\"api\"} 1"));
-        assert!(text.contains("pond_tasks_successful_total{pool=\"api\"} 1"));
-        assert!(text.contains("# TYPE pond_running_workers gauge"));
-        assert!(text.contains("pond_running_workers{pool=\"api\"} 1"));
-    }
-
-    #[cfg(feature = "metrics-export")]
-    #[test]
-    fn prometheus_label_is_escaped() {
-        let text = MetricsSnapshot::default().to_prometheus_text("a\"b\\c");
-        assert!(text.contains("pool=\"a\\\"b\\\\c\""));
     }
 
     #[test]

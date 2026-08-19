@@ -3,13 +3,12 @@
 //! Lifecycle / leak regression tests.
 //!
 //! These guard the fix for the background-watcher Arc cycle: before it, the
-//! cancel-watcher and metrics-export tasks held a strong `Arc<Inner>` and parked
-//! forever, so dropping a `Pool` without `stop()`/`cancel()` leaked `Inner` (and
-//! its permit channels, metrics and shared data) for the process lifetime.
+//! cancel-watcher task held a strong `Arc<Inner>` and parked forever, so
+//! dropping a `Pool` without `stop()`/`cancel()` leaked `Inner` (and its
+//! permit channels and shared data) for the process lifetime.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use pond::Pool;
 
@@ -36,26 +35,6 @@ async fn dropping_pool_without_stop_frees_inner() {
     assert!(
         weak.upgrade().is_none(),
         "Inner (and its task_data) leaked after dropping the pool"
-    );
-}
-
-#[tokio::test]
-async fn dropping_pool_with_metrics_export_frees_inner() {
-    let (data, weak) = probe();
-    let (tx, _rx) = async_channel::unbounded();
-    let pool = Pool::builder()
-        .max_concurrency(2)
-        .task_data(data)
-        .metrics_channel(Duration::from_millis(5), tx)
-        .build();
-    pool.submit(|| async { 7 }).await.unwrap();
-    drop(pool);
-
-    // The metrics task holds only a `Weak<Inner>`, so `Inner` frees immediately.
-    tokio::task::yield_now().await;
-    assert!(
-        weak.upgrade().is_none(),
-        "metrics-export task leaked Inner after drop"
     );
 }
 

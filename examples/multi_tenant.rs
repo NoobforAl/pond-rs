@@ -41,17 +41,18 @@ async fn main() {
 
     // Drain each tenant's work and report what completed.
     for (name, sub, handles) in tenant_pools {
+        let mut completed = 0;
         for h in handles {
-            let _ = h.await;
+            if h.await.is_ok() {
+                completed += 1;
+            }
         }
         println!(
-            "tenant {name:>8}: completed={} (cap {} of {} shared workers)",
-            sub.completed_tasks(),
+            "tenant {name:>8}: completed={completed} (cap {} of {} shared workers)",
             sub.max_concurrency(),
             pool.max_concurrency(),
         );
     }
 
     pool.stop_and_wait().await;
-    println!("shared pool: successful={} total", pool.successful_tasks());
 }

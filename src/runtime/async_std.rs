@@ -28,6 +28,13 @@ impl Spawner for AsyncStdSpawner {
         async_std::task::spawn(future);
     }
 
+    fn spawn_unboxed<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        async_std::task::spawn(future);
+    }
+
     fn spawn_blocking(&self, f: Box<dyn FnOnce() + Send + 'static>) {
         async_std::task::spawn_blocking(f);
     }

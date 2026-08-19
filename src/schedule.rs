@@ -11,7 +11,7 @@
 //!
 //! The actual work always runs through the pool's normal concurrency permits when
 //! it fires; only the *waiting* happens off-pool. A delayed/recurring/retry task
-//! is therefore counted in [metrics](crate::MetricsSnapshot) only once it fires.
+//! therefore only counts against the pool's concurrency once it fires.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -55,7 +55,10 @@ impl<S: Spawner> Pool<S> {
         let sleep = self.sleep(delay);
         self.spawn_detached(Box::pin(async move {
             sleep.await;
-            let result = pool.submit(task).await;
+            // `submit_async`, not `submit`: a delayed task must not be lost to a
+            // full bounded queue — it waits for a slot instead of rejecting.
+            // (The first `.await` is admission; the second runs the task.)
+            let result = pool.submit_async(task).await.await;
             let _ = tx.send(result);
         }));
         TaskHandle::new(rx)
@@ -164,7 +167,11 @@ impl<S: Spawner> Pool<S> {
                     }
                 }
                 let f = factory.clone();
-                match pool.submit(move || (f.as_ref())()).await {
+                // `submit_async` so an attempt is never lost to a full bounded
+                // queue — it waits for a slot instead of rejecting. (The first
+                // `.await` is admission; the second runs the attempt.)
+                let handle = pool.submit_async(move || (f.as_ref())()).await;
+                match handle.await {
                     Ok(Ok(value)) => {
                         let _ = tx.send(Ok(Ok(value)));
                         return;

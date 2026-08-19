@@ -1,12 +1,9 @@
-//! Builder config: stream task results to a channel, and push metrics snapshots
-//! to a channel periodically. Also shows the `ResultSink` interface letting you
-//! plug in any channel via a small newtype.
+//! Builder config: stream task results to a channel, and plug in any channel
+//! you like via the `ResultSink` interface.
 //!
 //! Run with: `cargo run --example config_channels`
 
-use std::time::Duration;
-
-use pond::{MetricsSnapshot, Pool, ResultSink};
+use pond::{Pool, ResultSink};
 use tokio::sync::mpsc;
 
 /// A custom sink: wrap any channel in a newtype and implement `ResultSink`.
@@ -58,26 +55,6 @@ async fn main() {
     let custom = pool.results_to(TokioSink(ctx));
     custom.submit(|| async { 7 });
     println!("custom-sink result: {}", crx.recv().await.unwrap());
-
-    // --- 4. Periodic metrics export to a channel. ---
-    let (mtx, mrx) = async_channel::unbounded::<MetricsSnapshot>();
-    let monitored = Pool::builder()
-        .max_concurrency(2)
-        .pool_name("worker_pool")
-        .metrics_channel(Duration::from_millis(20), mtx)
-        .build();
-    for _ in 0..3 {
-        monitored.spawn(|| async { tokio::time::sleep(Duration::from_millis(5)).await });
-    }
-    if let Ok(snap) = mrx.recv().await {
-        // In a real service you'd render `snap.to_prometheus_text(...)` (the
-        // metrics-export feature) and serve it from /metrics.
-        println!(
-            "metrics snapshot: submitted={}, completed={}",
-            snap.submitted, snap.completed
-        );
-    }
-    monitored.stop_and_wait().await;
 
     pool.stop_and_wait().await;
 }

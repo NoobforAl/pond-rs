@@ -34,8 +34,8 @@ fn submit_counts_are_synchronous_and_runtime_free() {
         });
     }
 
-    // `submitted` and `spawn` both happen synchronously inside submit/spawn.
-    assert_eq!(pool.metrics().submitted, 5);
+    // `submit`/`spawn` both happen synchronously inside the call: all five
+    // task futures are already on the spawner.
     assert_eq!(spawner.spawn_count(), spawns_after_build + 5);
 }
 

@@ -5,17 +5,15 @@ project conventions, and a few decisions worth knowing before you open a PR.
 
 ## Development setup
 
-A `Makefile` wraps the common cargo commands (it deliberately avoids
-`--all-features`, because `tokio-console` needs a special `RUSTFLAGS`):
+A `Makefile` wraps the common cargo commands:
 
 ```bash
-make test        # tests on the safe feature set
-make test-all    # tests + doctests on ALL features (every runtime + monitoring)
+make test        # tests on the default feature set
+make test-all    # tests + doctests on ALL features (every runtime)
 make clippy      # clippy with warnings denied
 make fmt-check   # formatting check
 make doc         # build the API docs
 make all         # fmt-check + clippy + test-all (run this before pushing)
-make console     # type-check the tokio-console feature (sets tokio_unstable)
 ```
 
 Reports & profiling (saved to files, opened in your browser):
@@ -25,7 +23,6 @@ make bench         # run Criterion benchmarks
 make report        # open the Criterion HTML report (target/criterion/report/)
 make coverage      # HTML coverage report (needs: cargo install cargo-llvm-cov)
 make flamegraph    # CPU flamegraph of the benches (needs: cargo install flamegraph)
-make metrics-dump  # write Prometheus monitoring output to target/metrics.prom
 ```
 
 ## Feature flags
@@ -35,11 +32,8 @@ The crate is split into opt-in features (see `Cargo.toml` and the README table):
 - Runtime adapters — exactly the async runtime the `Pool` spawns on:
   `runtime-tokio` (default), `runtime-smol`, `runtime-async-std`.
 - `blocking` — the synchronous `blocking::Pool` (default).
-- `tracing` — zero-cost-when-off instrumentation (spans/events).
-- `tokio-console` — live task monitoring; requires `RUSTFLAGS="--cfg tokio_unstable"`.
-- `metrics-export` — `MetricsSnapshot::to_prometheus_text` (no extra dependency).
 
-The "safe" feature set used throughout CI is `runtime-tokio,blocking,tracing`.
+The default feature set used throughout CI is `runtime-tokio,blocking`.
 
 ## Adding a new runtime adapter
 
@@ -65,8 +59,8 @@ support a new runtime:
   `ConcurrencyTracker`) are in `tests/common/`.
 - Prefer deterministic synchronization (channels, `Notify`, `tokio::test`
   `start_paused`, and `wait_until` polling) over fixed sleeps.
-- Run doctests with `cargo test --doc --features runtime-tokio,blocking,tracing`.
-- Property tests (metrics invariants) use `proptest`; never `await` inside a
+- Run doctests with `cargo test --doc --features runtime-tokio,blocking`.
+- Property tests (counter invariants) use `proptest`; never `await` inside a
   `proptest!` closure — drive any async via `Runtime::block_on`.
 
 ### Why no `loom`?

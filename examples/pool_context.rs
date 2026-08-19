@@ -38,9 +38,4 @@ async fn main() {
         }
     }
     println!("completed = {completed}, canceled = {canceled}");
-    println!(
-        "metrics: successful={}, canceled={}",
-        pool.successful_tasks(),
-        pool.canceled_tasks()
-    );
 }

@@ -2,7 +2,7 @@
 #![cfg(feature = "runtime-tokio")]
 //! Integration tests for the async [`Pool`].
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +27,6 @@ async fn stop_and_wait_does_not_hang_after_unrecovered_panic() {
     tokio::time::timeout(Duration::from_secs(5), pool.stop_and_wait())
         .await
         .expect("stop_and_wait hung after a non-recovered panic");
-    assert_eq!(pool.running_workers(), 0);
 }
 
 #[tokio::test]
@@ -87,23 +86,6 @@ async fn respects_max_concurrency() {
 }
 
 #[tokio::test]
-async fn metrics_track_submitted_and_completed() {
-    let pool = Pool::builder().max_concurrency(4).build();
-    let mut handles = Vec::new();
-    for i in 0..10 {
-        handles.push(pool.submit(move || async move { i }));
-    }
-    for h in handles {
-        h.await.unwrap();
-    }
-    let m = pool.metrics();
-    assert_eq!(m.submitted, 10);
-    assert_eq!(m.successful, 10);
-    assert_eq!(m.completed, 10);
-    assert_eq!(m.failed, 0);
-}
-
-#[tokio::test]
 async fn try_submit_rejects_when_queue_full() {
     // Concurrency 1, queue capacity 1: one running + one queued is the max.
     let pool = Pool::builder()
@@ -111,30 +93,25 @@ async fn try_submit_rejects_when_queue_full() {
         .queue_size(QueueSize::Bounded(1))
         .build();
 
-    // Block the single worker.
+    // Block the single worker; `started` flips once the task body is running
+    // (i.e. it has left the queue and holds the only concurrency permit).
     let gate = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(AtomicBool::new(false));
     let g = gate.clone();
+    let s = started.clone();
     let _busy = pool.submit(move || async move {
+        s.store(true, Ordering::SeqCst);
         g.notified().await;
     });
+    wait_until(|| started.load(Ordering::SeqCst)).await;
 
-    // Fill the queue (capacity 1).
-    wait_until({
-        let pool = pool.clone();
-        move || pool.running_workers() == 1
-    })
-    .await;
+    // Fill the queue (capacity 1); admission is synchronous, so once this
+    // returns Ok the queue is genuinely full.
     let _queued = pool.try_submit(|| async {}).expect("first queued task ok");
 
     // Now the queue is full -> reject.
-    wait_until({
-        let pool = pool.clone();
-        move || pool.waiting_tasks() >= 1
-    })
-    .await;
     let rejected = pool.try_submit(|| async {});
     assert_eq!(rejected.err(), Some(Error::QueueFull));
-    assert!(pool.dropped_tasks() >= 1);
 
     gate.notify_waiters();
     pool.stop_and_wait().await;
@@ -149,22 +126,16 @@ async fn non_blocking_submit_drops_and_resolves_queue_full() {
         .build();
 
     let gate = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(AtomicBool::new(false));
     let g = gate.clone();
+    let s = started.clone();
     let _busy = pool.submit(move || async move {
+        s.store(true, Ordering::SeqCst);
         g.notified().await;
     });
-    wait_until({
-        let pool = pool.clone();
-        move || pool.running_workers() == 1
-    })
-    .await;
+    wait_until(|| started.load(Ordering::SeqCst)).await;
 
     let _queued = pool.submit(|| async {});
-    wait_until({
-        let pool = pool.clone();
-        move || pool.waiting_tasks() >= 1
-    })
-    .await;
 
     // Dropped task's handle resolves with QueueFull.
     let dropped = pool.submit(|| async { 99 });
@@ -181,7 +152,6 @@ async fn unbounded_queue_never_drops() {
         let _h = pool.try_submit(|| async {}).expect("never rejected");
     }
     pool.stop_and_wait().await;
-    assert_eq!(pool.dropped_tasks(), 0);
 }
 
 #[tokio::test]
@@ -192,7 +162,6 @@ async fn panic_is_recovered_by_default() {
         Err(Error::Panicked(msg)) => assert!(msg.contains("boom")),
         other => panic!("expected Panicked, got {other:?}"),
     }
-    assert_eq!(pool.failed_tasks(), 1);
 
     // Pool stays healthy after a panic.
     assert_eq!(pool.submit(|| async { 7 }).await.unwrap(), 7);
@@ -220,8 +189,6 @@ async fn stop_and_wait_drains_queued_tasks() {
     }
     pool.stop_and_wait().await;
     assert_eq!(counter.load(Ordering::SeqCst), 100);
-    assert_eq!(pool.running_workers(), 0);
-    assert_eq!(pool.waiting_tasks(), 0);
 }
 
 #[tokio::test]
@@ -229,17 +196,15 @@ async fn cancel_cancels_queued_tasks() {
     let pool = Pool::builder().max_concurrency(1).build();
 
     let gate = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(AtomicBool::new(false));
     let g = gate.clone();
+    let s = started.clone();
     let running = pool.submit(move || async move {
+        s.store(true, Ordering::SeqCst);
         g.notified().await;
         "done"
     });
-
-    wait_until({
-        let pool = pool.clone();
-        move || pool.running_workers() == 1
-    })
-    .await;
+    wait_until(|| started.load(Ordering::SeqCst)).await;
 
     // Queue several tasks behind the busy worker.
     let queued: Vec<_> = (0..5)
@@ -254,7 +219,6 @@ async fn cancel_cancels_queued_tasks() {
     for h in queued {
         assert_eq!(h.await, Err(Error::Canceled));
     }
-    assert!(pool.canceled_tasks() >= 1);
 }
 
 #[tokio::test]
@@ -328,15 +292,16 @@ async fn submit_async_applies_backpressure() {
         sum += h.await.unwrap();
     }
     assert_eq!(sum, (0..10).sum());
-    assert_eq!(pool.dropped_tasks(), 0);
 }
 
 #[tokio::test]
 async fn pool_is_cloneable_and_shares_state() {
     let pool = Pool::builder().max_concurrency(2).build();
     let clone = pool.clone();
-    clone.submit(|| async {}).await.unwrap();
-    assert_eq!(pool.submitted_tasks(), 1);
+    // Work submitted through the clone runs on the same pool, so the original
+    // observes its result and keeps serving work.
+    assert_eq!(clone.submit(|| async { 21 }).await.unwrap() * 2, 42);
+    assert_eq!(pool.submit(|| async { 7 }).await.unwrap(), 7);
 }
 
 #[tokio::test]
@@ -396,15 +361,14 @@ async fn deadline_cancels_pending_work() {
 
     // Occupy the single worker so the rest stay queued past the deadline.
     let gate = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(AtomicBool::new(false));
     let g = gate.clone();
+    let s = started.clone();
     let busy = pool.submit(move || async move {
+        s.store(true, Ordering::SeqCst);
         g.notified().await;
     });
-    wait_until({
-        let pool = pool.clone();
-        move || pool.running_workers() == 1
-    })
-    .await;
+    wait_until(|| started.load(Ordering::SeqCst)).await;
 
     let queued: Vec<_> = (0..3)
         .map(|i| pool.submit(move || async move { i }))

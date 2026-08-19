@@ -15,7 +15,7 @@ An idiomatic, runtime-agnostic worker pool for Rust.
   feature: `runtime-tokio` (default), `runtime-smol`, or `runtime-async-std`. Any other runtime
   works by implementing `Spawner` yourself.
 - Task **handles** (awaitable futures), **task groups**, **subpools**, dynamic **resize**,
-  graceful **shutdown**, **cancellation**, and rich **metrics**.
+  graceful **shutdown**, and **cancellation**.
 - **Context integration**: bridge any external cancellation source or deadline into the pool, and
   hand each task a `TaskContext` to break early or carry/stream data.
 - **Concurrency partitioning**: cap a group or subpool to a slice of the pool (e.g. on a pool of
@@ -90,9 +90,6 @@ let _ = handle.wait();
 | `runtime-smol`      | no      | smol adapter (`SmolSpawner`), backed by `async-global-executor`. |
 | `runtime-async-std` | no      | `async-std` adapter (`AsyncStdSpawner`).                         |
 | `blocking`          | yes     | Synchronous, thread-based `blocking::Pool`.                       |
-| `tracing`           | no      | Debug/monitoring: emit `tracing` spans + events (zero cost when off). |
-| `tokio-console`     | no      | Live async task monitoring via tokio-console (needs `tokio_unstable`). |
-| `metrics-export`    | no      | `MetricsSnapshot::to_prometheus_text` (Prometheus exposition; no extra deps). |
 
 Pick a non-default runtime with `--no-default-features` plus the runtime you want, then build the
 pool with `Pool::builder_with`:
@@ -109,33 +106,6 @@ assert_eq!(result, 3);
 > fixed task pools (no dynamic/boxed-future spawning) and no `spawn_blocking`, which is incompatible
 > with this pool's runtime-agnostic `Spawner` model. It targets `no_std` embedded; pond is `std`.
 
-## Monitoring & debugging
-
-Enable the **`tracing`** feature to observe task timing and pool behavior in tests
-and while debugging. The pools then emit `tracing` spans (`target = "pond"`):
-`pond.task` (one per task — its duration is the task's wall-clock time),
-`pond.submit` / `pond.try_submit` / `pond.submit_async`, `pond.group.wait`,
-`pond.stop`, and `pond.resize`. Attach any subscriber:
-
-```bash
-cargo run --example tracing_debug --features tracing
-```
-
-```rust
-tracing_subscriber::fmt().with_max_level(tracing::Level::TRACE).init();
-```
-
-For a **live** view of tasks (poll counts, busy/idle time), use tokio-console:
-
-```bash
-RUSTFLAGS="--cfg tokio_unstable" cargo run --features tokio-console
-# in your code, once: pond::monitor::init_console();
-```
-
-> Leave both features **off in production** — with the feature disabled every
-> instrumentation site is compiled out, so there is no runtime cost. (This is the
-> Rust compiler removing the debug code, exactly as intended.)
-
 ## Development
 
 ```bash
@@ -150,9 +120,16 @@ unreachable `pub`, enables `clippy::all`) plus `clippy.toml` (MSRV).
 
 Benchmarks (Criterion):
 
-- `benches/pool_bench.rs` — raw submit/await throughput for the async and blocking pools.
+- `benches/pool_bench.rs` — raw submit/await throughput for the async and blocking pools,
+  with a `tokio::spawn` baseline so pond's per-task overhead is measurable.
 - `benches/workload_bench.rs` — representative workloads: CPU-bound tasks, concurrency scaling,
   I/O-like yielding tasks, and multi-producer contention.
+- `benches/lifecycle_bench.rs` — build → drain → drop cost of short-lived pools and subpools
+  (the per-request-pool churn pattern).
+
+Leak/heap regression tests live in `tests/leak.rs` (pool-churn `Weak` probes) and
+`tests/heap.rs` (a dhat-based check that sustained workloads don't grow live heap; dhat is a
+dev-dependency, never shipped).
 
 Realistic, scenario-based tests modeled on a database connection pool (capped concurrent queries,
 scatter/gather, transaction abort-on-error, backpressure, per-tenant subpool isolation) live in

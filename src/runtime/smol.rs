@@ -30,6 +30,13 @@ impl Spawner for SmolSpawner {
         async_global_executor::spawn(future).detach();
     }
 
+    fn spawn_unboxed<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        async_global_executor::spawn(future).detach();
+    }
+
     fn spawn_blocking(&self, f: Box<dyn FnOnce() + Send + 'static>) {
         async_global_executor::spawn_blocking(f).detach();
     }

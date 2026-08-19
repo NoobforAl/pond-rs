@@ -1,10 +1,8 @@
 #![allow(missing_docs)]
 #![cfg(feature = "runtime-tokio")]
-//! Tests for builder config: result-channel streaming and periodic metrics.
+//! Tests for builder config: result-channel streaming and pool naming.
 
-use std::time::Duration;
-
-use pond::{MetricsSnapshot, Pool, PoolConfig};
+use pond::{Pool, PoolConfig};
 
 #[tokio::test]
 async fn result_pool_streams_each_result() {
@@ -74,40 +72,12 @@ async fn try_group_result_channel_streams_oks_and_errs() {
     assert_eq!(errs, 1);
 }
 
-#[tokio::test(start_paused = true)]
-async fn metrics_channel_pushes_snapshots_until_stop() {
-    let (tx, rx) = async_channel::unbounded::<MetricsSnapshot>();
-    let pool = Pool::builder()
-        .max_concurrency(2)
-        .metrics_channel(Duration::from_millis(100), tx)
-        .build();
-
-    pool.submit(|| async { 1 }).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(350)).await; // ~3 intervals
-
-    let mut snapshots = 0;
-    while let Ok(snap) = rx.try_recv() {
-        assert_eq!(snap.submitted, 1);
-        snapshots += 1;
-    }
-    assert!(snapshots >= 3, "expected >= 3 snapshots, got {snapshots}");
-
-    pool.stop_and_wait().await;
-    while rx.try_recv().is_ok() {} // drain
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        rx.try_recv().is_err(),
-        "no snapshots should arrive after stop"
-    );
-}
-
 #[tokio::test]
 async fn config_struct_matches_individual_methods() {
     let by_method = Pool::builder().pool_name("api").build();
     let by_config = Pool::builder()
         .config(PoolConfig {
             pool_name: Some("api".into()),
-            metrics: None,
         })
         .build();
     assert_eq!(by_method.name(), Some("api"));
