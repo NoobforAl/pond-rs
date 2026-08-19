@@ -45,20 +45,34 @@ async fn pool_churn_frees_every_inner() {
         pool.stop_and_wait().await;
         drop(pool);
 
-        // All task futures are terminal, so `Inner` frees once the runtime
-        // reaps the last future's stack. Poll briefly instead of assuming the
-        // very first yield is enough.
+        // `stop_and_wait` returns once every task has reached a terminal
+        // state, and that signal is sent from *inside* the task future (see
+        // `RunningGuard::drop`). The future — and the `Arc<Inner>` it owns — is
+        // dropped by the runtime a moment later, on whichever worker thread ran
+        // it. So `Inner` is expected to outlive `stop_and_wait` briefly; this
+        // waits for that, it does not assume it has already happened.
+        //
+        // The wait is against a wall clock rather than a yield count. A count of
+        // `yield_now()` calls is not a wait at all: it reschedules *this* task
+        // and never blocks on another thread reaping its task cell, so under CPU
+        // contention (CI runners especially) the loop could run out while the
+        // drop was still pending. A real leak still fails here — nothing ever
+        // frees `Inner` and the deadline expires.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut freed = false;
-        for _ in 0..1_000 {
-            tokio::task::yield_now().await;
+        loop {
             if weak.upgrade().is_none() {
                 freed = true;
                 break;
             }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         assert!(
             freed,
-            "round {round}: pool Inner leaked after stop_and_wait + drop"
+            "round {round}: pool Inner still alive 5s after stop_and_wait + drop"
         );
     }
 }
