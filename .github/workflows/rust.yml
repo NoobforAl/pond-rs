@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust 1.75
-        uses: dtolnay/rust-toolchain@1.75
+        uses: dtolnay/rust-toolchain@1.120
       - uses: Swatinem/rust-cache@v2
       # Build only: the library must compile on the declared MSRV. Tests pull in
       # dev-dependencies (criterion, etc.) whose own MSRV may be newer.
