@@ -50,7 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust 1.75
-        uses: dtolnay/rust-toolchain@1.75
+        uses: dtolnay/rust-toolchain@1.120
       - uses: Swatinem/rust-cache@v2
       # tokio 1.54 needs Rust 1.85, and this cargo can't pick an older release by
       # itself. Our `tokio = "1"` still allows 1.53, the newest that fits 1.75, so
