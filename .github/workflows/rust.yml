@@ -23,7 +23,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -48,10 +48,17 @@ jobs:
     name: MSRV (1.75)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust 1.75
         uses: dtolnay/rust-toolchain@1.75
       - uses: Swatinem/rust-cache@v2
+      # tokio 1.54 needs Rust 1.85, and this cargo can't pick an older release by
+      # itself. Our `tokio = "1"` still allows 1.53, the newest that fits 1.75, so
+      # users on 1.75 pin it the same way.
+      - name: Pin dependencies to MSRV-compatible versions
+        run: |
+          cargo generate-lockfile
+          cargo update -p tokio --precise 1.53.1
       # Build only: the library must compile on the declared MSRV. Tests pull in
       # dev-dependencies (criterion, etc.) whose own MSRV may be newer.
       - name: Build (safe features)
@@ -61,7 +68,7 @@ jobs:
     name: MSRV (1.85, optional runtimes)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust 1.85
         uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
@@ -76,7 +83,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -106,7 +113,7 @@ jobs:
     name: Dependency hygiene
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -135,14 +142,14 @@ jobs:
     name: cargo-deny (licenses + advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -153,7 +160,7 @@ jobs:
       - name: Generate coverage
         run: cargo llvm-cov --features "$SAFE_FEATURES" --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}

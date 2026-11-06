@@ -97,6 +97,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   budget.
 
 ### Changed
+- Tokio 1.54 raised its minimum to Rust 1.85. pond's MSRV stays 1.75, but on Rust
+  older than 1.85 Tokio must be pinned: `cargo update -p tokio --precise 1.53.1`.
+- Bumped `rusqlite` (dev-only) to 0.41, and CI to `actions/checkout` v7 and
+  `codecov/codecov-action` v7.
 - **`queue_size` now counts only tasks waiting behind busy workers.** A burst that
   free workers can absorb is no longer rejected with `QueueFull` (10 idle workers
   and `queue_size(1)` used to reject the second task of a burst), and

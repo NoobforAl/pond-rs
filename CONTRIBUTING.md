@@ -85,6 +85,9 @@ The minimum supported Rust version is **1.75** for the default features
 dependencies (`async-global-executor`, `async-lock`). CI builds both. Bumping the
 MSRV is a notable change — call it out in the PR and `CHANGELOG.md`.
 
+On Rust older than 1.85, `tokio` must be pinned below 1.54, which raised its own
+minimum: `cargo update -p tokio --precise 1.53.1`. The MSRV job does the same.
+
 ## Pull requests
 
 1. `make all` passes (fmt, clippy with `-D warnings`, tests).

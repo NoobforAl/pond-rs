@@ -73,7 +73,7 @@ proptest = "1"
 # build. Nothing in `src/` may reference it — `cargo tree -e normal` must show
 # no rusqlite. `bundled` is deliberate over a system SQLite so the tests need no
 # preinstalled library on any platform.
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 
 # Tokio-only examples (they build the async pool via `Pool::builder()` and run on
 # `#[tokio::main]`), so they are only compiled when the default tokio runtime is
