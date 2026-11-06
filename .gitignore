@@ -5,19 +5,14 @@
 *.so
 *.dylib
 
-# Test binary, built with `go test -c`
-*.test
-
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
-
 # Rust
 /target
 Cargo.lock
 
-# Tracy bin exc
+# Tracy profiler binaries and captures
+/tracy/
 *.tracy
-tracu
+
 # Scratch output from the CI dependency-hygiene check
 shipped-tree.txt
 

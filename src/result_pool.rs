@@ -90,7 +90,7 @@ impl<S: Spawner, T: Send + 'static> ResultPool<S, T> {
         });
     }
 
-    /// The underlying pool, e.g. for metrics or shutdown.
+    /// The underlying pool, e.g. to resize it or shut it down.
     pub fn pool(&self) -> &Pool<S> {
         &self.pool
     }

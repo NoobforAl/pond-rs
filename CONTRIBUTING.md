@@ -79,9 +79,11 @@ pool overhead is measurable.
 
 ## MSRV
 
-The minimum supported Rust version is **1.75** (`rust-version` in `Cargo.toml`,
-also pinned in `clippy.toml`). CI verifies a build on 1.75. Bumping the MSRV is a
-notable change — call it out in the PR and `CHANGELOG.md`.
+The minimum supported Rust version is **1.75** for the default features
+(`rust-version` in `Cargo.toml`, also pinned in `clippy.toml`). The optional
+`runtime-smol` and `runtime-async-std` features need **1.85**, because of their
+dependencies (`async-global-executor`, `async-lock`). CI builds both. Bumping the
+MSRV is a notable change — call it out in the PR and `CHANGELOG.md`.
 
 ## Pull requests
 

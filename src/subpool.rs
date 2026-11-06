@@ -2,7 +2,8 @@
 //!
 //! A subpool shares the parent's runtime and worker budget, while additionally
 //! limiting how many of *its* tasks run at once. Stopping or cancelling a subpool
-//! does not affect the parent. A `Subpool` mirrors the [`Pool`] surface: it can
+//! does not affect the parent; stopping the parent drains queued subpool tasks,
+//! and cancelling it abandons them. A `Subpool` mirrors the [`Pool`] surface: it can
 //! submit (blocking / try / async / fire-and-forget / context-aware), resize,
 //! cancel, and run task groups.
 
@@ -12,15 +13,15 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use event_listener::Event;
+use event_listener::{Event, IntoNotification};
 use futures::channel::oneshot;
-use futures::future::{select, Either};
 use futures::FutureExt;
 
 use crate::cancel::CancelToken;
 use crate::context::TaskContext;
 use crate::error::{panic_message, Error, Result};
 use crate::group::{ResultTaskGroup, TryTaskGroup};
+use crate::limiter::Limiter;
 use crate::metrics::Metrics;
 use crate::options::QueueSize;
 use crate::pool::{Pool, StopHandle, TaskHandle};
@@ -58,12 +59,7 @@ impl<S: Spawner> Clone for Subpool<S> {
 
 struct SubInner<S: Spawner> {
     parent: Pool<S>,
-    permit_tx: async_channel::Sender<()>,
-    permit_rx: async_channel::Receiver<()>,
-    limited: AtomicBool,
-    max_concurrency: AtomicUsize,
-    // Serializes `resize` so concurrent calls don't interleave permit changes.
-    resize_lock: std::sync::Mutex<()>,
+    limiter: Limiter,
     capacity: usize, // queued-task cap (usize::MAX == unbounded)
     metrics: Metrics,
     // Tasks admitted but not yet terminal; idle detection keys off this single
@@ -102,22 +98,10 @@ impl<S: Spawner> Subpool<S> {
         } else {
             max_concurrency
         };
-        let limited = effective != 0;
-
-        let (permit_tx, permit_rx) = async_channel::unbounded::<()>();
-        if limited {
-            for _ in 0..effective {
-                let _ = permit_tx.try_send(());
-            }
-        }
 
         let inner = Arc::new(SubInner {
             parent,
-            permit_tx,
-            permit_rx,
-            limited: AtomicBool::new(limited),
-            max_concurrency: AtomicUsize::new(effective),
-            resize_lock: std::sync::Mutex::new(()),
+            limiter: Limiter::new(effective),
             capacity,
             metrics: Metrics::new(),
             outstanding: AtomicUsize::new(0),
@@ -128,8 +112,8 @@ impl<S: Spawner> Subpool<S> {
             shutdown: Arc::new(Event::new()),
         });
 
-        // Watch cancellation: close the permit channel and wake waiters so
-        // cancelled tasks observe it (works for `cancel()` and external tokens).
+        // Watch cancellation: close the limiter and wake waiters so cancelled
+        // tasks observe it (works for `cancel()` and external tokens).
         //
         // Holds a `Weak<SubInner>` and races a `shutdown` signal (fired by
         // `Drop`) so it never keeps the subpool alive and exits promptly when the
@@ -138,14 +122,12 @@ impl<S: Spawner> Subpool<S> {
         let cancel = inner.cancel.clone();
         let shutdown = inner.shutdown.clone();
         inner.parent.spawn_detached(Box::pin(async move {
-            let cancelled = Box::pin(cancel.cancelled());
-            if let Either::Right(_) = select(cancelled, shutdown.listen()).await {
+            if !cancel.cancelled_unless_dropped(&shutdown, &weak).await {
                 return; // subpool dropped: `SubInner` is gone, nothing to do
             }
             if let Some(inner) = weak.upgrade() {
                 inner.closed.store(true, Ordering::Relaxed);
-                inner.permit_rx.close();
-                inner.permit_tx.close();
+                inner.limiter.close();
                 inner.slot.notify(usize::MAX);
                 inner.idle.notify(usize::MAX);
             }
@@ -259,62 +241,85 @@ impl<S: Spawner> Subpool<S> {
         T: Send + 'static,
     {
         // Queued + outstanding counters were already bumped by the caller's
-        // admission step (`try_admit`).
+        // admission step (`try_admit`), so from here on the guard settles them,
+        // whatever happens to the task.
         let (tx, rx) = oneshot::channel();
+        let mut guard = SubTask {
+            inner: self.inner.clone(),
+            tx: Some(tx),
+            queued: true,
+            running: false,
+            reserved: false,
+        };
+
+        // Have the parent count this task from now on, so stopping the parent
+        // drains it even while it is still queued here.
+        guard.reserved = self.inner.parent.try_reserve().is_ok();
+        if !guard.reserved {
+            drop(guard); // the parent stopped since `is_stopped`: resolves `rx`
+            return TaskHandle::new(rx);
+        }
+
+        // Take the subpool permit *before* asking the parent for anything: tasks
+        // queued here must hold none of the parent's permits or queue slots, or a
+        // busy subpool would starve the parent's other work. The result flows
+        // through our own oneshot so we control cancellation, panic capture and
+        // metrics.
         let run = self.inner.clone();
+        self.inner.parent.spawn_detached_unboxed(async move {
+            let mut guard = guard;
+            // `None` means the subpool was cancelled; the check below disposes.
+            let _permit = run.limiter.acquire().await;
 
-        // Run on the parent (consuming a parent permit), gated by a subpool
-        // permit. The task's result flows through our own oneshot so we control
-        // cancellation, panic capture and metrics.
-        self.inner.parent.spawn(move || async move {
-            let _permit = if run.limited.load(Ordering::Relaxed) {
-                match run.permit_rx.recv().await {
-                    Ok(()) => Some(SubPermit { inner: &run }),
-                    Err(_) => None, // channel closed (cancelled): proceed to dispose
-                }
-            } else {
-                None
-            };
-
+            guard.queued = false;
             run.metrics.dec_waiting();
-            run.slot.notify(1);
+            run.slot.notify(1usize.additional());
 
             if run.cancel.is_cancelled() {
-                run.metrics.inc_canceled();
-                let _ = tx.send(Err(run.cancel.cause().unwrap_or(Error::Canceled)));
-                run.dispatch_done();
                 return;
             }
 
-            run.metrics.inc_running();
-            match AssertUnwindSafe(task()).catch_unwind().await {
-                Ok(value) => {
-                    run.metrics.inc_successful();
-                    let _ = tx.send(Ok(value));
-                }
-                Err(payload) => {
-                    run.metrics.inc_failed();
-                    let _ = tx.send(Err(Error::Panicked(panic_message(payload))));
-                }
-            }
-            run.metrics.dec_running();
-            run.dispatch_done();
+            let guard = &mut guard;
+            let run = &run;
+            run.parent
+                .run_reserved(move || async move {
+                    // The subpool may have been cancelled while this task waited
+                    // for the parent.
+                    if run.cancel.is_cancelled() {
+                        return;
+                    }
+                    guard.running = true;
+                    run.metrics.inc_running();
+                    // Called inside this block so the catch also covers a panic
+                    // in the closure's synchronous part.
+                    let body = async move { task().await };
+                    match AssertUnwindSafe(body).catch_unwind().await {
+                        Ok(value) => {
+                            run.metrics.inc_successful();
+                            guard.resolve(Ok(value));
+                        }
+                        Err(payload) => {
+                            run.metrics.inc_failed();
+                            guard.resolve(Err(Error::Panicked(panic_message(payload))));
+                        }
+                    }
+                })
+                .await;
         });
 
         TaskHandle::new(rx)
     }
 
-    /// Returns `true` if the subpool has been stopped or cancelled.
+    /// Returns `true` if the subpool has been stopped or cancelled, or its parent
+    /// has (a subpool can't run anything once its parent is stopped).
     pub fn is_stopped(&self) -> bool {
-        self.inner.closed.load(Ordering::Relaxed) || self.inner.cancel.is_cancelled()
+        self.inner.closed.load(Ordering::Relaxed)
+            || self.inner.cancel.is_cancelled()
+            || self.inner.parent.is_stopped()
     }
 
     fn stop_error(&self) -> Error {
-        if self.inner.cancel.is_cancelled() {
-            self.inner.cancel.cause().unwrap_or(Error::Canceled)
-        } else {
-            Error::PoolStopped
-        }
+        self.inner.stop_error()
     }
 
     /// Signals the subpool to stop and returns a future that completes once its
@@ -344,7 +349,9 @@ impl<S: Spawner> Subpool<S> {
 
     /// Dynamically changes the subpool's maximum concurrency.
     ///
-    /// `0` makes it unbounded. Cannot exceed the parent's bound (when bounded).
+    /// `0` makes it unbounded, releasing every queued task. Cannot exceed the
+    /// parent's bound (when bounded). As with [`Pool::resize`], lowering the limit
+    /// never interrupts running tasks.
     ///
     /// # Panics
     ///
@@ -356,45 +363,14 @@ impl<S: Spawner> Subpool<S> {
                 "subpool max_concurrency ({max_concurrency}) cannot exceed parent's ({parent_max})"
             );
         }
-        let inner = &self.inner;
-        // Serialize against other resizes so permit reconciliation is atomic.
-        let _resize = inner.resize_lock.lock().unwrap();
-        let old = inner
-            .max_concurrency
-            .swap(max_concurrency, Ordering::Relaxed);
-        if max_concurrency == 0 {
-            inner.limited.store(false, Ordering::Relaxed);
-            for _ in 0..inner.permit_rx.receiver_count().max(1) {
-                let _ = inner.permit_tx.try_send(());
-            }
-            return;
-        }
-        let was_unbounded = old == 0;
-        inner.limited.store(true, Ordering::Relaxed);
-        if was_unbounded {
-            for _ in 0..max_concurrency {
-                let _ = inner.permit_tx.try_send(());
-            }
-        } else if max_concurrency > old {
-            for _ in 0..(max_concurrency - old) {
-                let _ = inner.permit_tx.try_send(());
-            }
-        } else if max_concurrency < old {
-            let surplus = old - max_concurrency;
-            let rx = inner.permit_rx.clone();
-            inner.parent.spawn_detached(Box::pin(async move {
-                for _ in 0..surplus {
-                    if rx.recv().await.is_err() {
-                        break;
-                    }
-                }
-            }));
-        }
+        self.inner.limiter.set_limit(max_concurrency);
+        // A higher limit means more free workers, which also frees queue room.
+        self.inner.slot.notify(usize::MAX);
     }
 
     /// The subpool's effective maximum concurrency (`0` == unbounded).
     pub fn max_concurrency(&self) -> usize {
-        self.inner.max_concurrency.load(Ordering::Relaxed)
+        self.inner.limiter.limit()
     }
 
     /// Creates a [`ResultTaskGroup`] scoped to this subpool.
@@ -415,10 +391,29 @@ impl<S: Spawner> SubInner<S> {
         self.outstanding.load(Ordering::Relaxed) == 0
     }
 
-    /// Atomically admits a task only if the bounded queue has room.
+    /// Why this subpool isn't accepting or running work. The parent comes before
+    /// this subpool's own graceful stop, which rejects new work but never abandons
+    /// queued tasks: if one was abandoned, a cancellation is the real reason.
+    fn stop_error(&self) -> Error {
+        if self.cancel.is_cancelled() {
+            self.cancel.cause().unwrap_or(Error::Canceled)
+        } else if self.parent.is_stopped() {
+            self.parent.stop_error()
+        } else if self.closed.load(Ordering::Relaxed) {
+            Error::PoolStopped
+        } else {
+            Error::Canceled
+        }
+    }
+
+    /// Atomically admits a task only if the bounded queue or a free worker has
+    /// room.
     #[inline]
     fn try_admit(&self) -> bool {
-        if self.metrics.try_reserve_waiting(self.capacity) {
+        if self
+            .metrics
+            .try_reserve_waiting(self.capacity, || self.limiter.available())
+        {
             self.outstanding.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -535,16 +530,46 @@ impl<S: Spawner> SubpoolBuilder<S> {
     }
 }
 
-/// Releases a subpool permit on drop.
-///
-/// Borrows the subpool's `SubInner` (the task future owns an `Arc<SubInner>`
-/// for its whole life), so acquiring a permit costs no `Arc` clone.
-struct SubPermit<'a, S: Spawner> {
-    inner: &'a SubInner<S>,
+/// One admitted subpool task. Settles the counters and signals idle on drop,
+/// however the task ended: finished, panicked, disposed of by this subpool or its
+/// parent, or dropped by a runtime shutting down (even before its first poll). A
+/// task that never produced a result resolves its handle with the stop error.
+struct SubTask<S: Spawner, T> {
+    inner: Arc<SubInner<S>>,
+    tx: Option<oneshot::Sender<Result<T>>>,
+    queued: bool,
+    running: bool,
+    reserved: bool,
 }
 
-impl<S: Spawner> Drop for SubPermit<'_, S> {
+impl<S: Spawner, T> SubTask<S, T> {
+    fn resolve(&mut self, result: Result<T>) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+impl<S: Spawner, T> Drop for SubTask<S, T> {
     fn drop(&mut self) {
-        let _ = self.inner.permit_tx.try_send(());
+        let inner = self.inner.clone();
+        if self.queued {
+            inner.metrics.dec_waiting();
+        }
+        if self.running {
+            inner.metrics.dec_running();
+        } else {
+            inner.metrics.inc_canceled();
+        }
+        self.resolve(Err(inner.stop_error()));
+        // The permit this task held makes a worker free, which is queue room.
+        // (Nobody ever waits for room in an unbounded queue.)
+        if inner.capacity != usize::MAX {
+            inner.slot.notify(1usize.additional());
+        }
+        if self.reserved {
+            inner.parent.release_reservation();
+        }
+        inner.dispatch_done();
     }
 }

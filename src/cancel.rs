@@ -8,10 +8,11 @@
 //! versus an explicit cancel).
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{fence, AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use event_listener::Event;
+use futures::future::{select, Either};
 
 use crate::error::Error;
 use crate::runtime::Spawner;
@@ -150,6 +151,43 @@ impl CancelToken {
             }
             listener.await;
         }
+    }
+
+    /// Waits for cancellation on behalf of a background watcher that must not
+    /// outlive `owner`. Returns `true` if cancelled, or `false` once `owner` is
+    /// gone (its `Drop` must notify `shutdown`).
+    ///
+    /// The watcher may first run after `owner` has already dropped, when the
+    /// notification has come and gone. Registering the listener and only then
+    /// checking `owner` covers both orderings.
+    pub(crate) async fn cancelled_unless_dropped<T>(
+        &self,
+        shutdown: &Event,
+        owner: &Weak<T>,
+    ) -> bool {
+        let dropped = shutdown.listen();
+        // ordering: pairs with the full fence in `Event::notify`, so either this
+        // load sees the strong count at zero or the notify sees the listener.
+        fence(Ordering::SeqCst);
+        if owner.strong_count() == 0 {
+            return false;
+        }
+        matches!(
+            select(Box::pin(self.cancelled()), dropped).await,
+            Either::Left(_)
+        )
+    }
+}
+
+/// Cancels `token` when dropped, unless disarmed with [`std::mem::forget`].
+///
+/// Group tasks hold one while running, so both a returned error and a panic
+/// (caught further out, by the pool) cancel the group as soon as they happen.
+pub(crate) struct CancelOnDrop<'a>(pub(crate) &'a CancelToken);
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 

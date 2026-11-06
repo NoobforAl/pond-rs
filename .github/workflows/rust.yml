@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -32,6 +35,12 @@ jobs:
         run: cargo test --no-default-features --features runtime-tokio --verbose
       - name: Test (all runtimes)
         run: cargo test --features "runtime-tokio,runtime-smol,runtime-async-std,blocking" --verbose
+      # With tokio enabled, `Pool::builder()` binds to it, so only these runs
+      # exercise the other adapters as the sole runtime.
+      - name: Test (smol only)
+        run: cargo test --no-default-features --features runtime-smol --verbose
+      - name: Test (async-std only)
+        run: cargo test --no-default-features --features runtime-async-std --verbose
       - name: Doctests
         run: cargo test --doc --features "$SAFE_FEATURES" --verbose
 
@@ -47,6 +56,21 @@ jobs:
       # dev-dependencies (criterion, etc.) whose own MSRV may be newer.
       - name: Build (safe features)
         run: cargo build --features "$SAFE_FEATURES" --verbose
+
+  msrv-optional-runtimes:
+    name: MSRV (1.85, optional runtimes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      # These adapters depend on crates that need newer Rust than the crate's
+      # `rust-version`, which covers the default features. See CONTRIBUTING.md.
+      - name: Build (smol)
+        run: cargo build --no-default-features --features runtime-smol --verbose
+      - name: Build (async-std)
+        run: cargo build --no-default-features --features runtime-async-std --verbose
 
   lint:
     name: Lint

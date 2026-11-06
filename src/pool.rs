@@ -4,19 +4,20 @@ use std::any::Any;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use event_listener::Event;
+use event_listener::{Event, IntoNotification};
 use futures::channel::oneshot;
-use futures::future::{select, BoxFuture, Either};
+use futures::future::BoxFuture;
 use futures::FutureExt;
 
 use crate::cancel::CancelToken;
 use crate::context::TaskContext;
 use crate::error::{panic_message, Error, Result};
 use crate::group::{GroupBuilder, ResultTaskGroup, TryGroupBuilder, TryTaskGroup};
+use crate::limiter::Limiter;
 use crate::metrics::Metrics;
 use crate::options::PoolBuilder;
 use crate::runtime::Spawner;
@@ -49,17 +50,8 @@ impl<S: Spawner> Clone for Pool<S> {
 
 struct Inner<S: Spawner> {
     spawner: S,
-    // Permit channel acts as a counting semaphore. A worker must hold a permit
-    // (a `()` token) to run when concurrency is limited.
-    permit_tx: async_channel::Sender<()>,
-    permit_rx: async_channel::Receiver<()>,
-    // When false, concurrency is unbounded and permits are skipped.
-    limited: AtomicBool,
-    max_concurrency: AtomicUsize, // 0 == unbounded
-    // Serializes `resize` so concurrent calls can't interleave their permit
-    // reconciliation and leave the live permit budget out of step with
-    // `max_concurrency`. `resize` is rare, so the lock is uncontended.
-    resize_lock: std::sync::Mutex<()>,
+    // A task must hold a permit from this to run.
+    limiter: Limiter,
     min_concurrency: usize, // resize floor (0 == none)
     capacity: usize,        // queue capacity (usize::MAX == unbounded)
     panic_recovery: bool,
@@ -72,8 +64,9 @@ struct Inner<S: Spawner> {
     // single counter rather than `waiting == 0 && running == 0`, which has a race
     // window between a task being dequeued (waiting--) and started (running++).
     outstanding: AtomicUsize,
-    idle: Event, // notified when the pool becomes fully idle
-    slot: Event, // notified when a queue slot frees up
+    idle: Event,    // notified when the pool becomes fully idle
+    slot: Event,    // notified when a queue slot frees up
+    stopped: Event, // notified when the pool is stopped or cancelled
     // Notified when the last `Pool` handle drops, so the background watcher
     // (which holds a `Weak<Inner>`) wakes and terminates instead of parking
     // forever. See `Drop for Inner`.
@@ -127,23 +120,10 @@ impl<S: Spawner> Pool<S> {
         let deadline = b.deadline.take();
         let task_data = b.task_data.take();
         let name = b.pool_name.take();
-        let limited = b.max_concurrency != 0;
-        // An unbounded token channel: `send` never blocks, so releasing a permit
-        // is always immediate.
-        let (permit_tx, permit_rx) = async_channel::unbounded::<()>();
-        if limited {
-            for _ in 0..b.max_concurrency {
-                let _ = permit_tx.try_send(());
-            }
-        }
 
         let inner = Arc::new(Inner {
             spawner: b.spawner,
-            permit_tx,
-            permit_rx,
-            limited: AtomicBool::new(limited),
-            max_concurrency: AtomicUsize::new(b.max_concurrency),
-            resize_lock: std::sync::Mutex::new(()),
+            limiter: Limiter::new(b.max_concurrency),
             min_concurrency: b.min_concurrency,
             capacity: b.queue_size.capacity(),
             panic_recovery: b.panic_recovery,
@@ -153,6 +133,7 @@ impl<S: Spawner> Pool<S> {
             outstanding: AtomicUsize::new(0),
             idle: Event::new(),
             slot: Event::new(),
+            stopped: Event::new(),
             shutdown: Arc::new(Event::new()),
             task_data,
             name,
@@ -169,17 +150,16 @@ impl<S: Spawner> Pool<S> {
         let cancel = inner.cancel.clone();
         let shutdown = inner.shutdown.clone();
         inner.spawner.spawn(Box::pin(async move {
-            let cancelled = Box::pin(cancel.cancelled());
-            if let Either::Right(_) = select(cancelled, shutdown.listen()).await {
+            if !cancel.cancelled_unless_dropped(&shutdown, &weak).await {
                 return; // pool dropped: nothing to clean up, `Inner` is gone
             }
             if let Some(inner) = weak.upgrade() {
                 // ordering: `Relaxed` — `closed` is an independent stop flag; the
-                // channel `close()` calls below provide the real synchronization.
+                // limiter and event notifications below do the synchronizing.
                 inner.closed.store(true, Ordering::Relaxed);
-                inner.permit_rx.close();
-                inner.permit_tx.close();
+                inner.limiter.close();
                 inner.slot.notify(usize::MAX);
+                inner.stopped.notify(usize::MAX);
                 inner.idle.notify(usize::MAX);
             }
         }));
@@ -304,6 +284,76 @@ impl<S: Spawner> Pool<S> {
         self.inner.spawner.sleep(dur)
     }
 
+    /// Like [`spawn_detached`](Self::spawn_detached), without boxing the future.
+    pub(crate) fn spawn_detached_unboxed<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.inner.spawner.spawn_unboxed(fut);
+    }
+
+    /// Resolves once the pool is stopped or cancelled.
+    pub(crate) async fn stopped(&self) {
+        loop {
+            if self.is_stopped() {
+                return;
+            }
+            let listener = self.inner.stopped.listen();
+            // ordering: pairs with the full fence in `Event::notify`, so either
+            // this re-check sees the stop or the notify sees the listener.
+            fence(Ordering::SeqCst);
+            if self.is_stopped() {
+                return;
+            }
+            listener.await;
+        }
+    }
+
+    /// Counts work a subpool has accepted but not yet handed over, so stopping
+    /// this pool drains it too. Fails if the pool is already stopped. Each `Ok`
+    /// must be paired with [`release_reservation`](Self::release_reservation).
+    pub(crate) fn try_reserve(&self) -> Result<()> {
+        if self.is_stopped() {
+            return Err(self.stop_error());
+        }
+        self.inner.inc_outstanding();
+        Ok(())
+    }
+
+    pub(crate) fn release_reservation(&self) {
+        self.inner.dispatch_done();
+    }
+
+    /// Runs `task` inline on the caller's runtime task, under this pool's queue
+    /// and permit rules, on behalf of a subpool holding a
+    /// [`try_reserve`](Self::try_reserve). The reservation is why a graceful stop
+    /// doesn't reject here; if the pool is cancelled, `task` is dropped unrun.
+    pub(crate) async fn run_reserved<F, Fut, T>(&self, task: F)
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = T> + Send,
+        T: Send + 'static,
+    {
+        self.inner.metrics.inc_submitted();
+        loop {
+            if self.inner.cancel.is_cancelled() {
+                return;
+            }
+            if self.inner.try_admit() {
+                break;
+            }
+            let listener = self.inner.slot.listen();
+            if self.inner.try_admit() {
+                break;
+            }
+            if self.inner.cancel.is_cancelled() {
+                return;
+            }
+            listener.await;
+        }
+        run_task(TaskGuard::new(self.inner.clone()), task, None).await;
+    }
+
     /// Submits a task, rejecting immediately if the pool is stopped or its
     /// bounded queue is full.
     ///
@@ -377,84 +427,14 @@ impl<S: Spawner> Pool<S> {
         // bumped by the caller's admission step (`try_admit`). `tx` is `None`
         // for fire-and-forget tasks, which skip the result channel entirely.
         //
-        // A single `Arc` clone moved into the task future (the worker body). The
-        // submit path itself uses `&self.inner`, saving one inc/dec per submit.
-        let inner = self.inner.clone();
-        let mut tx = tx;
-        let task_fut = async move {
-            // Acquire a permit when concurrency is limited.
-            // ordering: `Relaxed` — this flag only gates the fast path; the permit
-            // handoff itself is synchronized by the channel.
-            //
-            // The guard borrows `inner` (which the task future owns for its
-            // whole life) rather than cloning the sender, so acquiring a permit
-            // costs no atomic refcount traffic.
-            let _permit = if inner.limited.load(Ordering::Relaxed) {
-                match inner.permit_rx.recv().await {
-                    Ok(()) => Some(PermitGuard {
-                        tx: &inner.permit_tx,
-                    }),
-                    Err(_) => None, // channel closed (cancelled): proceed to dispose
-                }
-            } else {
-                None
-            };
-
-            inner.metrics.dec_waiting();
-            inner.slot.notify(1);
-
-            // Cancelled tasks are disposed without running.
-            if inner.cancel.is_cancelled() {
-                inner.metrics.inc_canceled();
-                if let Some(tx) = tx.take() {
-                    let _ = tx.send(Err(inner.cancel.cause().unwrap_or(Error::Canceled)));
-                }
-                inner.dispatch_done();
-                return;
-            }
-
-            inner.metrics.inc_running();
-            // Decrement the running tally and signal idle on the way out via a
-            // guard, so this still runs if a non-recovered task panics and
-            // unwinds. Without it, `running` would leak and `stop_and_wait` (which
-            // waits for the pool to go idle) could hang forever.
-            //
-            // Borrows `inner` instead of cloning the `Arc`: the guard lives
-            // strictly inside this future, which owns `inner` and outlives it
-            // even while unwinding.
-            let _running = RunningGuard { inner: &inner };
-
-            if inner.panic_recovery {
-                match AssertUnwindSafe(task()).catch_unwind().await {
-                    Ok(value) => {
-                        inner.metrics.inc_successful();
-                        if let Some(tx) = tx.take() {
-                            let _ = tx.send(Ok(value));
-                        }
-                    }
-                    Err(payload) => {
-                        inner.metrics.inc_failed();
-                        if let Some(tx) = tx.take() {
-                            let _ = tx.send(Err(Error::Panicked(panic_message(payload))));
-                        }
-                    }
-                }
-            } else {
-                // No recovery: a panic here propagates on the worker task and the
-                // handle's sender drops, so an awaiter observes `Canceled`. The
-                // `RunningGuard` above still runs its cleanup during unwinding.
-                let value = task().await;
-                inner.metrics.inc_successful();
-                if let Some(tx) = tx.take() {
-                    let _ = tx.send(Ok(value));
-                }
-            }
-        };
+        // The guard exists before the future does, so even a future the runtime
+        // drops without ever polling (it is shutting down) still settles them.
+        let guard = TaskGuard::new(self.inner.clone());
 
         // Hand the concrete future to the runtime unboxed: the runtime's own
         // task allocation stores it inline, so the pool no longer pays a
         // separate `Box` allocation (and an indirection per poll) per task.
-        self.inner.spawner.spawn_unboxed(task_fut);
+        self.inner.spawner.spawn_unboxed(run_task(guard, task, tx));
     }
 
     /// Signals the pool to stop accepting new tasks and returns a future that
@@ -466,6 +446,7 @@ impl<S: Spawner> Pool<S> {
         // event, which carries its own synchronization.
         self.inner.closed.store(true, Ordering::Relaxed);
         self.inner.slot.notify(usize::MAX);
+        self.inner.stopped.notify(usize::MAX);
         let inner = self.inner.clone();
         StopHandle {
             fut: Box::pin(async move { inner.wait_idle().await }),
@@ -496,7 +477,7 @@ impl<S: Spawner> Pool<S> {
         self.inner.closed.load(Ordering::Relaxed) || self.inner.cancel.is_cancelled()
     }
 
-    fn stop_error(&self) -> Error {
+    pub(crate) fn stop_error(&self) -> Error {
         if self.inner.cancel.is_cancelled() {
             self.inner.cancel.cause().unwrap_or(Error::Canceled)
         } else {
@@ -506,66 +487,29 @@ impl<S: Spawner> Pool<S> {
 
     /// Dynamically changes the maximum concurrency.
     ///
-    /// `0` makes concurrency unbounded. Growing adds permits immediately;
-    /// shrinking retires permits as running tasks release them (in-flight tasks
-    /// are never interrupted).
+    /// `0` makes concurrency unbounded, releasing every queued task. Raising the
+    /// limit lets more queued tasks start immediately; lowering it holds new
+    /// starts until enough running tasks have finished (in-flight tasks are never
+    /// interrupted). A bounded limit is raised to the configured
+    /// [`min_concurrency`](crate::PoolBuilder::min_concurrency) floor if needed.
     pub fn resize(&self, max_concurrency: usize) {
         let inner = &self.inner;
-        // Serialize against other resizes so permit reconciliation is atomic.
-        let _resize = inner.resize_lock.lock().unwrap();
         // Honor the configured floor: never shrink bounded concurrency below it.
         let max_concurrency = if max_concurrency == 0 {
             0
         } else {
             max_concurrency.max(inner.min_concurrency)
         };
-        // ordering: `Relaxed` — `max_concurrency`/`limited` are config flags; the
-        // permit channel below carries the actual concurrency synchronization.
-        let old = inner
-            .max_concurrency
-            .swap(max_concurrency, Ordering::Relaxed);
-        if max_concurrency == 0 {
-            // Become unbounded: stop requiring permits and wake any waiters.
-            inner.limited.store(false, Ordering::Relaxed);
-            // Top up tokens so any task currently blocked on `recv` proceeds.
-            for _ in 0..inner.permit_rx.receiver_count().max(1) {
-                let _ = inner.permit_tx.try_send(());
-            }
-            return;
-        }
-
-        let was_unbounded = old == 0;
-        inner.limited.store(true, Ordering::Relaxed);
-
-        if was_unbounded {
-            // Seed a fresh budget of permits.
-            for _ in 0..max_concurrency {
-                let _ = inner.permit_tx.try_send(());
-            }
-        } else if max_concurrency > old {
-            for _ in 0..(max_concurrency - old) {
-                let _ = inner.permit_tx.try_send(());
-            }
-        } else if max_concurrency < old {
-            // Drain surplus permits as they become available.
-            let surplus = old - max_concurrency;
-            let rx = inner.permit_rx.clone();
-            inner.spawner.spawn(Box::pin(async move {
-                for _ in 0..surplus {
-                    if rx.recv().await.is_err() {
-                        break;
-                    }
-                }
-            }));
-        }
+        inner.limiter.set_limit(max_concurrency);
+        // A higher limit means more free workers, which also frees queue room.
+        inner.slot.notify(usize::MAX);
     }
 
     // --- Concurrency config ---------------------------------------------------
 
     /// The configured maximum concurrency (`0` == unbounded).
     pub fn max_concurrency(&self) -> usize {
-        // ordering: `Relaxed` — reading a config value, not synchronizing on it.
-        self.inner.max_concurrency.load(Ordering::Relaxed)
+        self.inner.limiter.limit()
     }
 
     // --- Groups & subpools --------------------------------------------------
@@ -606,12 +550,11 @@ impl<S: Spawner> Pool<S> {
     }
 
     /// Creates a subpool that runs on this pool but limits its own concurrency
-    /// to `max_concurrency` tasks.
+    /// to `max_concurrency` tasks (`0` inherits this pool's limit).
     ///
     /// # Panics
     ///
-    /// Panics if `max_concurrency` exceeds this pool's bound (when bounded), or
-    /// if it is zero.
+    /// Panics if `max_concurrency` exceeds this pool's bound (when bounded).
     pub fn subpool(&self, max_concurrency: usize) -> Subpool<S> {
         Subpool::new(self.clone(), max_concurrency)
     }
@@ -624,12 +567,16 @@ impl<S: Spawner> Inner<S> {
         self.outstanding.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Atomically admits a task only if the bounded queue has room, closing the
-    /// check-then-increment race. Returns `false` (admitting nothing) when full.
-    /// An unbounded queue (`capacity == usize::MAX`) always admits.
+    /// Atomically admits a task only if the bounded queue or a free worker has
+    /// room, closing the check-then-increment race. Returns `false` (admitting
+    /// nothing) when full. An unbounded queue (`capacity == usize::MAX`) always
+    /// admits.
     #[inline]
     fn try_admit(&self) -> bool {
-        if self.metrics.try_reserve_waiting(self.capacity) {
+        if self
+            .metrics
+            .try_reserve_waiting(self.capacity, || self.limiter.available())
+        {
             self.inc_outstanding();
             true
         } else {
@@ -676,30 +623,103 @@ impl<S: Spawner> Drop for Inner<S> {
     }
 }
 
-/// Guard returned to a running task; releases its permit on drop.
-///
-/// Borrows the pool's permit sender (the task future owns an `Arc<Inner>` for
-/// its whole life), so a permit acquisition costs no `Arc` clone.
-struct PermitGuard<'a> {
-    tx: &'a async_channel::Sender<()>,
-}
+/// The worker body of one admitted task.
+async fn run_task<S, F, Fut, T>(
+    mut guard: TaskGuard<S>,
+    task: F,
+    mut tx: Option<oneshot::Sender<Result<T>>>,
+) where
+    S: Spawner,
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = T> + Send,
+    T: Send + 'static,
+{
+    // `None` means the pool was cancelled; the check below disposes of the task.
+    // Declared after `guard`, so the permit is back before the guard reports the
+    // task finished.
+    let _permit = guard.inner.limiter.acquire().await;
 
-impl Drop for PermitGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self.tx.try_send(());
+    guard.queued = false;
+    guard.inner.metrics.dec_waiting();
+    guard.inner.slot.notify(1usize.additional());
+
+    // Cancelled tasks are disposed without running.
+    if guard.inner.cancel.is_cancelled() {
+        if let Some(tx) = tx.take() {
+            let _ = tx.send(Err(guard.inner.cancel.cause().unwrap_or(Error::Canceled)));
+        }
+        return;
+    }
+
+    guard.running = true;
+    guard.inner.metrics.inc_running();
+
+    // Called inside this async block so the catch below also covers a panic in
+    // the closure's synchronous part, before it returns its future.
+    let run = async move { task().await };
+
+    if guard.inner.panic_recovery {
+        match AssertUnwindSafe(run).catch_unwind().await {
+            Ok(value) => {
+                guard.inner.metrics.inc_successful();
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(Ok(value));
+                }
+            }
+            Err(payload) => {
+                guard.inner.metrics.inc_failed();
+                if let Some(tx) = tx.take() {
+                    let _ = tx.send(Err(Error::Panicked(panic_message(payload))));
+                }
+            }
+        }
+    } else {
+        // No recovery: a panic here propagates on the worker task and the
+        // handle's sender drops, so an awaiter observes `Canceled`. The guard
+        // still settles the counters during unwinding.
+        let value = run.await;
+        guard.inner.metrics.inc_successful();
+        if let Some(tx) = tx.take() {
+            let _ = tx.send(Ok(value));
+        }
     }
 }
 
-/// Decrements the running-task tally and signals idle on drop — including during
-/// unwinding, so a non-recovered task panic can't leave `running` permanently
-/// elevated (which would wedge [`Pool::stop_and_wait`]).
-struct RunningGuard<'a, S: Spawner> {
-    inner: &'a Inner<S>,
+/// Settles an admitted task's counters and signals idle on drop, however the task
+/// ended: finished, disposed of, panicked, or dropped by a runtime shutting down
+/// (even before its first poll). Without this, a leaked count would wedge
+/// [`Pool::stop_and_wait`].
+struct TaskGuard<S: Spawner> {
+    inner: Arc<Inner<S>>,
+    queued: bool,
+    running: bool,
 }
 
-impl<S: Spawner> Drop for RunningGuard<'_, S> {
+impl<S: Spawner> TaskGuard<S> {
+    fn new(inner: Arc<Inner<S>>) -> Self {
+        Self {
+            inner,
+            queued: true,
+            running: false,
+        }
+    }
+}
+
+impl<S: Spawner> Drop for TaskGuard<S> {
     fn drop(&mut self) {
-        self.inner.metrics.dec_running();
+        if self.queued {
+            self.inner.metrics.dec_waiting();
+        }
+        if self.running {
+            self.inner.metrics.dec_running();
+        } else {
+            self.inner.metrics.inc_canceled();
+        }
+        // The permit this task held makes a worker free, which is queue room.
+        // (Nobody ever waits for room in an unbounded queue.)
+        if self.inner.capacity != usize::MAX {
+            self.inner.slot.notify(1usize.additional());
+        }
         self.inner.dispatch_done();
     }
 }

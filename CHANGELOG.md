@@ -43,6 +43,42 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   attributing per-task heap cost. Complements the assertion-only `heap.rs`.
 
 ### Fixed
+- **Subpools no longer starve their parent.** A queued subpool task used to hold a
+  parent permit while it waited for a subpool permit, so a small subpool with a
+  backlog could occupy every parent worker. A task now takes its subpool permit
+  first and holds nothing of the parent's until then.
+- **Subpool `stop_and_wait` no longer hangs** when the parent silently discarded a
+  task (parent stopped, cancelled, or its queue full), or after a panic in the
+  synchronous part of a task's closure. Every admitted task now has one accounting
+  guard, also on the async `Pool`, so a task dropped by a runtime shutting down
+  can't wedge `stop_and_wait` either.
+- **`resize` keeps its limits.** `resize(0)` now releases every queued task, not
+  one, and `resize(n)` after `resize(0)` no longer leaves extra permits behind (a
+  limit of 2 could run 5 tasks at once). Permits are now counted by a shared
+  semaphore instead of stored as channel tokens, replacing the duplicated logic in
+  `Pool` and `Subpool`.
+- **Task groups short-circuit when a task fails, not when `wait` reaches it.**
+  Previously a failure behind a slow task let every queued task run anyway. Applies
+  to async and blocking groups, for returned errors and panics alike.
+- **Panics in the synchronous part of a task's closure** (before it returns its
+  future) are now reported as `Error::Panicked` instead of `Error::Canceled`.
+- **Background watcher leak:** a `Pool` or `Subpool` dropped before its watcher
+  first ran left that task parked forever.
+- **Delayed work observes shutdown promptly:** `submit_after`, `submit_at`,
+  `schedule_every` and retry backoff now end as soon as the pool stops, instead of
+  sitting out the rest of the delay.
+- **Blocking pool:**
+  - With `panic_recovery(false)`, a worker lost to a panic is now replaced. Before,
+    the pool lost that capacity for good, and a one-thread pool hung forever.
+  - A `submit` blocked on a full queue while the pool stopped could enqueue its job
+    after the workers had gone, hanging `wait()`. It now gets `PoolStopped`.
+  - The pool now grows when a second task arrives before the only idle worker has
+    woken for the first, and can no longer overshoot `max_concurrency` under
+    concurrent submitters.
+  - Dropping the last handle now shuts the pool down in the background (queued
+    tasks still run) rather than leaking its threads.
+- Doc corrections: `Pool::subpool(0)` inherits the parent's limit (it never
+  panicked), and `ResultPool::pool` no longer suggests metrics, which aren't public.
 - Doctests now compile and pass under the non-Tokio runtime features
   (`runtime-smol`, `runtime-async-std`): `Pool::builder()` binds to the enabled
   runtime's global executor instead of existing only under `runtime-tokio`.
@@ -61,6 +97,20 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   budget.
 
 ### Changed
+- **`queue_size` now counts only tasks waiting behind busy workers.** A burst that
+  free workers can absorb is no longer rejected with `QueueFull` (10 idle workers
+  and `queue_size(1)` used to reject the second task of a burst), and
+  `submit_async` now wakes when a worker frees up. As a result `queue_size(0)` works
+  as "no queue": async pools run a task if a worker is free and otherwise reject,
+  or wait in `submit_async`, which used to hang. Blocking `submit` waits for a free
+  worker; on blocking pools `queue_size(0)` used to be silently unbounded.
+- **Cancelled groups report it.** `wait()` now returns the cancellation cause if
+  the group was cancelled and any task was skipped, as documented, instead of
+  `Ok` with the skipped results silently missing.
+- **`Subpool` follows its parent's shutdown.** `is_stopped()` is now also `true`
+  once the parent is stopped, and new submissions are rejected right away with the
+  parent's stop error. Queued subpool tasks count towards the parent's graceful
+  stop, and a parent cancel abandons them with its cause.
 - **Bounded blocking pools now apply real backpressure:** a `queue_size`-bounded
   blocking `Pool` (not `non_blocking`) blocks `submit` until a queue slot frees,
   instead of silently ignoring the bound. `non_blocking` still drops with

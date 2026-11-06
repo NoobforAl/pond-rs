@@ -2,6 +2,8 @@
 name = "pond-rs"
 version = "0.1.0"
 edition = "2021"
+# Covers the default features. `runtime-smol` and `runtime-async-std` pull in
+# crates that need Rust 1.85; see CONTRIBUTING.md.
 rust-version = "1.75"
 description = "An idiomatic, runtime-agnostic async + blocking worker pool for Rust."
 license = "MIT"

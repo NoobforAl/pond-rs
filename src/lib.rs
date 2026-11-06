@@ -37,22 +37,24 @@
 //!
 //! A few internal design notes for contributors and the curious:
 //!
-//! * **Concurrency is a permit channel, not a counter.** A bounded pool fills an
-//!   unbounded channel with `max_concurrency` `()` permits; each task must
-//!   receive one before running and returns it (via an RAII guard) when done.
-//!   This makes "wait for a free slot" a plain channel `recv().await` — no
-//!   condition variables — and makes [`resize`](Pool::resize) just add or drain
-//!   permits.
-//! * **Subpools layer a second gate.** A [`Subpool`] runs on its parent's workers
-//!   but holds its own permit channel, so a task must acquire *both* a subpool
-//!   permit and a parent permit. That is how a subpool caps its share of the
-//!   parent without a separate thread pool.
+//! * **Concurrency is a counting semaphore with a movable limit.** Each task
+//!   takes a permit before running and returns it (via an RAII guard) when done.
+//!   Permits are counted rather than stored as tokens, so
+//!   [`resize`](Pool::resize) only changes the limit and wakes waiters; there are
+//!   no tokens to add, drain or lose track of.
+//! * **Subpools layer a second gate, taken first.** A [`Subpool`] has its own
+//!   limiter, and a task takes a subpool permit *before* it asks for a parent
+//!   permit. Tasks queued on a subpool therefore hold nothing of the parent's,
+//!   which is how a subpool caps its share without starving other parent work.
+//! * **Every admitted task has one accounting guard.** It is created at admission
+//!   and settles the counters in `Drop`, so a task that panics, is disposed of,
+//!   or is dropped with its runtime can't wedge `stop_and_wait`.
 //! * **One submission path, abstracted by `TaskSink`.** [`Pool`] and [`Subpool`]
 //!   both implement [`TaskSink`], so task groups ([`ResultTaskGroup`],
 //!   [`TryTaskGroup`]) are generic over where they submit.
 //! * **Cancellation is an `event-listener` broadcast.** [`CancelToken`] flips an
 //!   atomic and wakes all waiters; the pool spawns one watcher task that reacts
-//!   by closing the permit channels and notifying idle/slot listeners. That
+//!   by closing the limiter and notifying idle/slot listeners. That
 //!   watcher holds only a `Weak` reference to the pool's shared state, so
 //!   **dropping the last [`Pool`] handle frees it and stops the watcher** even
 //!   if you never call `stop`/`cancel`.
@@ -67,6 +69,7 @@
 mod cancel;
 mod context;
 mod error;
+mod limiter;
 mod metrics;
 mod runtime;
 

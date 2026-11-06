@@ -75,15 +75,21 @@ impl Metrics {
         self.inner.waiting.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Atomically reserves a queue slot iff fewer than `capacity` tasks are
-    /// currently waiting, incrementing `waiting` on success.
+    /// Atomically reserves a queue slot iff fewer than `capacity` plus
+    /// `free_workers()` tasks are currently waiting, incrementing `waiting` on
+    /// success. Free workers count because a task admitted while one is free goes
+    /// straight to it rather than sitting in the queue.
     ///
     /// This closes the check-then-increment race in the submit paths: concurrent
-    /// callers can no longer all observe `waiting < capacity` and then each push,
-    /// overshooting a bounded queue. Returns `false` (without incrementing) when
-    /// the queue is already full.
+    /// callers can no longer all observe room and then each push, overshooting a
+    /// bounded queue. Returns `false` (without incrementing) when the queue is
+    /// already full.
     #[inline]
-    pub(crate) fn try_reserve_waiting(&self, capacity: usize) -> bool {
+    pub(crate) fn try_reserve_waiting(
+        &self,
+        capacity: usize,
+        free_workers: impl Fn() -> usize,
+    ) -> bool {
         // An unbounded queue can never reject, so the CAS loop below has no work
         // to do: skip straight to an unconditional `fetch_add`. This matters
         // under many concurrent submitters, where a CAS loop has to retry every
@@ -93,9 +99,12 @@ impl Metrics {
             return true;
         }
 
-        let cap = capacity as u64;
         let mut cur = self.inner.waiting.load(Ordering::Relaxed);
         loop {
+            // Read after `waiting`: a starting task takes its permit before it
+            // leaves `waiting`, so this order can only see too few free workers
+            // (a safe, momentary rejection), never too many.
+            let cap = capacity.saturating_add(free_workers()) as u64;
             if cur >= cap {
                 return false;
             }
@@ -114,6 +123,18 @@ impl Metrics {
     #[inline]
     pub(crate) fn dec_waiting(&self) {
         self.inner.waiting.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Number of tasks queued but not yet running. The blocking pool reads this
+    /// to decide whether to grow.
+    #[cfg(any(feature = "blocking", test))]
+    #[cfg_attr(
+        not(any(feature = "blocking", feature = "runtime-tokio")),
+        allow(dead_code)
+    )]
+    #[inline]
+    pub(crate) fn waiting(&self) -> u64 {
+        self.inner.waiting.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -139,8 +160,9 @@ impl Metrics {
 
 // Read accessors exist only for the crate's own tests (the counters themselves
 // are live machinery — admission/backpressure key off them — but nothing in the
-// shipped library reads them back).
+// shipped library reads them back). The tests that use them need the tokio adapter.
 #[cfg(test)]
+#[cfg_attr(not(feature = "runtime-tokio"), allow(dead_code))]
 impl Metrics {
     #[inline]
     pub(crate) fn running(&self) -> u64 {
@@ -150,11 +172,6 @@ impl Metrics {
     #[inline]
     pub(crate) fn submitted(&self) -> u64 {
         self.inner.submitted.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub(crate) fn waiting(&self) -> u64 {
-        self.inner.waiting.load(Ordering::Relaxed)
     }
 
     // Single-counter accessors: load just the one atomic instead of taking a

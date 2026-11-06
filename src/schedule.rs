@@ -18,12 +18,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::channel::oneshot;
-use futures::future::{select, Either};
+use futures::future::{select, BoxFuture, Either};
 
 use crate::cancel::CancelToken;
 use crate::error::Result;
 use crate::pool::{Pool, TaskHandle};
 use crate::runtime::Spawner;
+
+/// Awaits `sleep`. Returns `false` if the pool stops first, so delayed work is
+/// rejected promptly rather than sitting out the rest of its delay.
+async fn sleep_unless_stopped<S: Spawner>(pool: &Pool<S>, sleep: BoxFuture<'static, ()>) -> bool {
+    matches!(
+        select(sleep, Box::pin(pool.stopped())).await,
+        Either::Left(_)
+    )
+}
 
 impl<S: Spawner> Pool<S> {
     /// Submits `task` to run after `delay` elapses, returning a handle that
@@ -31,7 +40,7 @@ impl<S: Spawner> Pool<S> {
     ///
     /// The wait does not occupy a worker; when the delay elapses the task enters
     /// the pool's normal permit-gated execution. If the pool is stopped before
-    /// then, the handle resolves with the stop error.
+    /// then, the handle resolves with the stop error right away.
     ///
     /// ```
     /// # #[tokio::main]
@@ -54,7 +63,10 @@ impl<S: Spawner> Pool<S> {
         let pool = self.clone();
         let sleep = self.sleep(delay);
         self.spawn_detached(Box::pin(async move {
-            sleep.await;
+            if !sleep_unless_stopped(&pool, sleep).await {
+                let _ = tx.send(Err(pool.stop_error()));
+                return;
+            }
             // `submit_async`, not `submit`: a delayed task must not be lost to a
             // full bounded queue — it waits for a slot instead of rejecting.
             // (The first `.await` is admission; the second runs the task.)
@@ -97,12 +109,12 @@ impl<S: Spawner> Pool<S> {
                 if watch.is_cancelled() || pool.is_stopped() {
                     break;
                 }
-                // Race the interval timer against cancellation so `stop()` is
-                // observed promptly even mid-wait.
+                // Race the interval timer against this schedule's token and the
+                // pool stopping, so either is observed promptly even mid-wait.
                 let tick = pool.sleep(interval);
-                let cancelled = Box::pin(watch.cancelled());
-                if let Either::Right(_) = select(tick, cancelled).await {
-                    break; // cancelled during the wait
+                let stop = select(Box::pin(watch.cancelled()), Box::pin(pool.stopped()));
+                if let Either::Right(_) = select(tick, stop).await {
+                    break; // stopped during the wait
                 }
                 if watch.is_cancelled() || pool.is_stopped() {
                     break;
@@ -161,7 +173,11 @@ impl<S: Spawner> Pool<S> {
             let mut backoff = policy.backoff;
             for attempt in 0..policy.max_attempts {
                 if attempt > 0 && !backoff.is_zero() {
-                    pool.sleep(policy.delay_for(backoff)).await;
+                    let sleep = pool.sleep(policy.delay_for(backoff));
+                    if !sleep_unless_stopped(&pool, sleep).await {
+                        let _ = tx.send(Err(pool.stop_error()));
+                        return;
+                    }
                     if policy.exponential {
                         backoff = backoff.saturating_mul(2);
                     }

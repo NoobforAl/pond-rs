@@ -12,7 +12,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::cancel::CancelToken;
+use crate::cancel::{CancelOnDrop, CancelToken};
 use crate::context::TaskContext;
 use crate::error::Error;
 use crate::pool::{Pool, TaskHandle};
@@ -80,10 +80,13 @@ impl<P: TaskSink, T: Send + 'static> ResultTaskGroup<P, T> {
         let token = self.token.clone();
         let handle = self.pool.submit(move || async move {
             if token.is_cancelled() {
-                Outcome::Skipped
-            } else {
-                Outcome::Done(task().await)
+                return Outcome::Skipped;
             }
+            // A panic unwinds through this and cancels the group immediately.
+            let on_panic = CancelOnDrop(&token);
+            let value = task().await;
+            std::mem::forget(on_panic);
+            Outcome::Done(value)
         });
         self.handles.push(handle);
         self
@@ -112,11 +115,15 @@ impl<P: TaskSink, T: Send + 'static> ResultTaskGroup<P, T> {
 
     /// Waits for all tasks, returning their outputs in submission order.
     ///
-    /// If any task panics or is cancelled, the group is cancelled and the first
-    /// such [`Error`] is returned.
+    /// A panicking task cancels the group as soon as it happens, whether or not
+    /// `wait` is running yet. If any task panicked, the error of the earliest one
+    /// in submission order is returned. Otherwise, if the group was cancelled and
+    /// any task was skipped as a result, the cancellation cause is returned: a
+    /// partial `Vec` would silently no longer line up with what was submitted.
     pub async fn wait(self) -> Result<Vec<T>, Error> {
         let mut out = Vec::with_capacity(self.handles.len());
         let mut first_err: Option<Error> = None;
+        let mut skipped = false;
         for handle in self.handles {
             match handle.await {
                 Ok(Outcome::Done(v)) => {
@@ -124,7 +131,7 @@ impl<P: TaskSink, T: Send + 'static> ResultTaskGroup<P, T> {
                         out.push(v);
                     }
                 }
-                Ok(Outcome::Skipped) => {}
+                Ok(Outcome::Skipped) => skipped = true,
                 Err(e) => {
                     if first_err.is_none() {
                         self.token.cancel();
@@ -135,6 +142,7 @@ impl<P: TaskSink, T: Send + 'static> ResultTaskGroup<P, T> {
         }
         match first_err {
             Some(e) => Err(e),
+            None if skipped => Err(self.token.cause().unwrap_or(Error::Canceled)),
             None => Ok(out),
         }
     }
@@ -194,10 +202,15 @@ impl<P: TaskSink, T: Send + 'static, E: Send + 'static> TryTaskGroup<P, T, E> {
         let token = self.token.clone();
         let handle = self.pool.submit(move || async move {
             if token.is_cancelled() {
-                Outcome::Skipped
-            } else {
-                Outcome::Done(task().await)
+                return Outcome::Skipped;
             }
+            // Cancels the group immediately on a returned `Err` or a panic.
+            let on_failure = CancelOnDrop(&token);
+            let result = task().await;
+            if result.is_ok() {
+                std::mem::forget(on_failure);
+            }
+            Outcome::Done(result)
         });
         self.handles.push(handle);
         self
@@ -224,11 +237,18 @@ impl<P: TaskSink, T: Send + 'static, E: Send + 'static> TryTaskGroup<P, T, E> {
         self.token.cancel();
     }
 
-    /// Waits for all tasks. Returns their outputs in submission order, or the
-    /// first error encountered (after cancelling the remaining queued tasks).
+    /// Waits for all tasks to finish or be skipped, and returns their outputs in
+    /// submission order.
+    ///
+    /// A failing task cancels the remaining queued tasks as soon as it fails,
+    /// whether or not `wait` is running yet. If any task failed, the error of the
+    /// earliest one in submission order is returned. Otherwise, if the group was
+    /// cancelled and any task was skipped as a result, the cancellation cause is
+    /// returned as [`GroupError::Pool`].
     pub async fn wait(self) -> Result<Vec<T>, GroupError<E>> {
         let mut out = Vec::with_capacity(self.handles.len());
         let mut first_err: Option<GroupError<E>> = None;
+        let mut skipped = false;
         for handle in self.handles {
             match handle.await {
                 Ok(Outcome::Done(Ok(v))) => {
@@ -242,7 +262,7 @@ impl<P: TaskSink, T: Send + 'static, E: Send + 'static> TryTaskGroup<P, T, E> {
                         first_err = Some(GroupError::Task(e));
                     }
                 }
-                Ok(Outcome::Skipped) => {}
+                Ok(Outcome::Skipped) => skipped = true,
                 Err(pe) => {
                     if first_err.is_none() {
                         self.token.cancel();
@@ -253,6 +273,9 @@ impl<P: TaskSink, T: Send + 'static, E: Send + 'static> TryTaskGroup<P, T, E> {
         }
         match first_err {
             Some(e) => Err(e),
+            None if skipped => Err(GroupError::Pool(
+                self.token.cause().unwrap_or(Error::Canceled),
+            )),
             None => Ok(out),
         }
     }

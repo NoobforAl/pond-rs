@@ -21,7 +21,9 @@ pub struct PoolConfig {
     pub pool_name: Option<String>,
 }
 
-/// The capacity of a pool's task queue (tasks accepted but not yet running).
+/// The capacity of a pool's task queue: how many tasks may wait when every worker
+/// is busy. Tasks a free worker can take don't count, so `Bounded(0)` means "run
+/// now or not at all" (a blocking pool's `submit` waits for a free worker instead).
 ///
 /// A `usize` converts to [`QueueSize::Bounded`], so builder methods accept either:
 ///

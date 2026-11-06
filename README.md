@@ -91,6 +91,8 @@ let _ = handle.wait();
 | `runtime-async-std` | no      | `async-std` adapter (`AsyncStdSpawner`).                         |
 | `blocking`          | yes     | Synchronous, thread-based `blocking::Pool`.                       |
 
+The default features need Rust 1.75; `runtime-smol` and `runtime-async-std` need Rust 1.85.
+
 Pick a non-default runtime with `--no-default-features` plus the runtime you want, then build the
 pool with `Pool::builder_with`:
 
