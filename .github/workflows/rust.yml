@@ -70,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust 1.85
-        uses: dtolnay/rust-toolchain@1.85
+        uses: dtolnay/rust-toolchain@1.120
       - uses: Swatinem/rust-cache@v2
       # These adapters depend on crates that need newer Rust than the crate's
       # `rust-version`, which covers the default features. See CONTRIBUTING.md.
